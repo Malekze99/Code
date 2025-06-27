@@ -25,7 +25,7 @@ from functools import lru_cache
 from tenacity import retry, stop_after_attempt, wait_exponential
 from imblearn.over_sampling import SMOTE
 import unittest
-
+from requests.exceptions import RequestException
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -53,7 +53,10 @@ BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V6'
 SIGNAL_GENERATION_TIMEFRAME: str = '15m'
 DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
 BTC_SYMBOL = 'BTCUSDT'
-
+#------------#
+# في بداية الكود
+REQUEST_DELAY = 0.3  # 300 مللي ثانية (للحسابات المجانية)
+REQUEST_DELAY = 0.1  # 100 مللي ثانية (للحسابات المميزة)
 # --- Indicator & Feature Parameters ---
 BBANDS_PERIOD: int = 20
 RSI_PERIOD: int = 14
@@ -107,12 +110,44 @@ def init_db():
 
 def get_binance_client():
     global client
+    max_retries = 5
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = Client(API_KEY, API_SECRET)
+            # اختبار اتصال خفيف الوزن
+            client.ping()
+            logger.info("✅ [Binance] تم الاتصال بنجاح.")
+            return
+        except Exception as e:
+            if 'code=-1003' in str(e):
+                # استخراج وقت انتهاء الحظر
+                ban_time = extract_ban_time(str(e))
+                current_time = time.time() * 1000
+                
+                if ban_time > current_time:
+                    wait_seconds = (ban_time - current_time) / 1000 + 10
+                    logger.warning(f"⚠️ [Binance] IP محظور حتى {datetime.utcfromtimestamp(ban_time/1000)}. إعادة المحاولة بعد {wait_seconds:.1f} ثانية...")
+                    time.sleep(wait_seconds)
+                else:
+                    logger.warning("⚠️ [Binance] تم رصد حظر منتهي. إعادة المحاولة فوراً.")
+                    time.sleep(10)
+            else:
+                logger.error(f"❌ [Binance] خطأ في المحاولة {attempt}/{max_retries}: {e}")
+                time.sleep(10)
+                
+    logger.critical("❌ [Binance] فشل جميع محاولات الاتصال.")
+    exit(1)
+
+def extract_ban_time(error_msg: str) -> float:
+    """استخراج وقت انتهاء الحظر من رسالة الخطأ"""
     try:
-        client = Client(API_KEY, API_SECRET)
-        client.ping()
-        logger.info("✅ [Binance] تم الاتصال بواجهة برمجة تطبيقات Binance بنجاح.")
-    except Exception as e:
-        logger.critical(f"❌ [Binance] فشل تهيئة عميل Binance: {e}"); exit(1)
+        match = re.search(r'until (\d+)', error_msg)
+        if match:
+            return float(match.group(1))
+    except:
+        return (time.time() + 300) * 1000  # افتراضي: 5 دقائق
+    return (time.time() + 300) * 1000
 
 def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
     if not client:
@@ -136,12 +171,30 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
         logger.error(f"❌ [Validation] خطأ في التحقق من الرموز: {e}"); return []
 
 # --- دوال جلب ومعالجة البيانات (مع التحسينات) ---
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def fetch_historical_data_retryable(symbol: str, interval: str, days: int) -> list:
-    start_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    return client.get_historical_klines(symbol, interval, start_str)
 
-@lru_cache(maxsize=32)
+@retry(stop=stop_after_attempt(3), 
+       wait=wait_exponential(multiplier=1, min=4, max=10),
+       retry=retry_if_exception_type(RequestException))
+def fetch_historical_data_retryable(symbol: str, interval: str, days: int) -> list:
+    try:
+        start_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        klines = client.get_historical_klines(symbol, interval, start_str)
+        
+        # إضافة تأخير للتحكم في معدل الطلبات
+        time.sleep(REQUEST_DELAY)
+        return klines
+    except Exception as e:
+        if 'code=-1003' in str(e):
+            ban_time = extract_ban_time(str(e))
+            current_time = time.time() * 1000
+            
+            if ban_time > current_time:
+                wait_seconds = (ban_time - current_time) / 1000 + 5
+                logger.warning(f"⚠️ [Binance] حظر مؤقت للرمز {symbol}. الانتظار {wait_seconds:.1f} ثانية...")
+                time.sleep(wait_seconds)
+            raise RequestException("Binance API Ban")  # إعادة رفع الاستثناء
+        else:
+            raise e
 def cached_fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     try:
         klines = fetch_historical_data_retryable(symbol, interval, days)
@@ -435,14 +488,15 @@ def train_symbol(symbol: str) -> Tuple[str, bool]:
         return symbol, False
 
 def run_training_job():
-    logger.info(f"🚀 Starting ADVANCED ML model training job ({BASE_ML_MODEL_NAME})...")
+    logger.info(f"🚀 بدء تدريب النموذج ({BASE_ML_MODEL_NAME})...")
     init_db()
-    get_binance_client()
-    fetch_and_cache_btc_data()
-    symbols_to_train = get_validated_symbols(filename='crypto_list.txt')
     
-    if not symbols_to_train:
-        logger.critical("❌ [Main] No valid symbols found. Exiting.")
+    try:
+        get_binance_client()
+        fetch_and_cache_btc_data()
+    except Exception as e:
+        logger.critical(f"❌ فشل التهيئة: {e}")
+        send_telegram_message("⛔ *فشل حرج*: تعذر الاتصال بـ Binance API")
         return
         
     send_telegram_message(f"🚀 *{BASE_ML_MODEL_NAME} Training Started*\nWill train models for {len(symbols_to_train)} symbols.")
