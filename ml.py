@@ -166,7 +166,16 @@ def get_binance_client():
         try:
             GENERAL_RATE_LIMITER.wait()
             
-            client_params = {"timeout": 30}
+            # إغلاق الاتصال السابق إذا كان موجوداً
+            if client:
+                try:
+                    client.close_connection()
+                except Exception as e:
+                    logger.warning(f"⚠️ [Binance] Warning closing previous connection: {e}")
+                client = None
+            
+            # إنشاء عميل جديد بدون معلمة timeout
+            client_params = {}
             if PROXY_URL:
                 client_params["proxies"] = {"https": PROXY_URL}
             
@@ -663,8 +672,11 @@ def status():
         
         # التحقق من اتصال Binance
         try:
-            client.ping()
-            binance_status = "connected"
+            if client:
+                client.ping()
+                binance_status = "connected"
+            else:
+                binance_status = "not initialized"
         except:
             binance_status = "disconnected"
         
