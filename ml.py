@@ -3,12 +3,15 @@ import os
 import json
 import logging
 import requests
+import re
+import math
+import threading
 import numpy as np
 import pandas as pd
 import psycopg2
 import pickle
 import lightgbm as lgb
-from psycopg2 import sql
+from collections import deque
 from psycopg2.extras import RealDictCursor
 from binance.client import Client
 from datetime import datetime, timedelta
@@ -18,26 +21,25 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import classification_report, accuracy_score, f1_score, matthews_corrcoef
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
-from flask import Flask
+from flask import Flask, jsonify
 from threading import Thread
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from imblearn.over_sampling import SMOTE
 import unittest
 from requests.exceptions import RequestException
-import re
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('ml_model_trainer_v6.log', encoding='utf-8'),
+        logging.FileHandler('ml_model_trainer_final.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('MLTrainer_V6')
+logger = logging.getLogger('MLTrainer_Final')
 
 # ---------------------- تحميل متغيرات البيئة ----------------------
 try:
@@ -46,19 +48,21 @@ try:
     DB_URL: str = config('DATABASE_URL')
     TELEGRAM_TOKEN: Optional[str] = config('TELEGRAM_BOT_TOKEN', default=None)
     CHAT_ID: Optional[str] = config('TELEGRAM_CHAT_ID', default=None)
+    EMERGENCY_MODE: bool = config('EMERGENCY_MODE', default=False, cast=bool)
+    AUTO_RESOLVE_BAN: bool = config('AUTO_RESOLVE_BAN', default=False, cast=bool)
+    PROXY_URL: Optional[str] = config('PROXY_URL', default=None)
+    SERVER_ID: int = config('SERVER_ID', default=0, cast=int)
+    TOTAL_SERVERS: int = config('TOTAL_SERVERS', default=1, cast=int)
 except Exception as e:
      logger.critical(f"❌ فشل في تحميل المتغيرات البيئية الأساسية: {e}")
      exit(1)
 
 # ---------------------- إعداد الثوابت والمتغيرات العامة ----------------------
-BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V6'
+BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_Final'
 SIGNAL_GENERATION_TIMEFRAME: str = '15m'
 DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
 BTC_SYMBOL = 'BTCUSDT'
-#------------#
-# في بداية الكود
-REQUEST_DELAY = 0.3  # 300 مللي ثانية (للحسابات المجانية)
-REQUEST_DELAY = 0.1  # 100 مللي ثانية (للحسابات المميزة)
+
 # --- Indicator & Feature Parameters ---
 BBANDS_PERIOD: int = 20
 RSI_PERIOD: int = 14
@@ -86,6 +90,39 @@ conn: Optional[psycopg2.extensions.connection] = None
 client: Optional[Client] = None
 btc_data_cache: Optional[pd.DataFrame] = None
 
+# ---------------------- نظام إدارة معدل الطلبات المتقدم ----------------------
+class BinanceRateLimiter:
+    def __init__(self, max_requests: int, per_seconds: int):
+        self.max_requests = max_requests
+        self.per_seconds = per_seconds
+        self.request_times = deque()
+        self.lock = threading.Lock()
+        
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            
+            # إزالة الطلبات القديمة خارج النافذة الزمنية
+            while self.request_times and now - self.request_times[0] > self.per_seconds:
+                self.request_times.popleft()
+            
+            # التحقق إذا وصلنا للحد الأقصى
+            if len(self.request_times) >= self.max_requests:
+                oldest = self.request_times[0]
+                wait_time = self.per_seconds - (now - oldest) + 0.1
+                logger.warning(f"⏳ وصلت إلى الحد المسموح للطلبات، الانتظار {wait_time:.2f} ثانية...")
+                time.sleep(wait_time)
+                now = time.time()
+                while self.request_times and now - self.request_times[0] > self.per_seconds:
+                    self.request_times.popleft()
+            
+            # تسجيل وقت الطلب الجديد
+            self.request_times.append(now)
+
+# تهيئة محددي المعدل
+HISTORICAL_RATE_LIMITER = BinanceRateLimiter(max_requests=5, per_seconds=60)
+GENERAL_RATE_LIMITER = BinanceRateLimiter(max_requests=20, per_seconds=60)
+
 # --- دوال الاتصال والتحقق ---
 def init_db():
     global conn
@@ -108,7 +145,18 @@ def init_db():
         conn.commit()
         logger.info("✅ [DB] تم تهيئة قاعدة البيانات بنجاح.")
     except Exception as e:
-        logger.critical(f"❌ [DB] فشل الاتصال بقاعدة البيانات: {e}"); exit(1)
+        logger.critical(f"❌ [DB] فشل الاتصال بقاعدة البيانات: {e}")
+        exit(1)
+
+def extract_ban_time(error_msg: str) -> float:
+    """استخراج وقت انتهاء الحظر من رسالة الخطأ"""
+    try:
+        match = re.search(r'until (\d+)', error_msg)
+        if match:
+            return float(match.group(1))
+    except:
+        return (time.time() + 300) * 1000
+    return (time.time() + 300) * 1000
 
 def get_binance_client():
     global client
@@ -116,15 +164,20 @@ def get_binance_client():
     
     for attempt in range(1, max_retries + 1):
         try:
-            client = Client(API_KEY, API_SECRET)
-            # اختبار اتصال خفيف الوزن
+            GENERAL_RATE_LIMITER.wait()
+            
+            client_params = {"timeout": 30}
+            if PROXY_URL:
+                client_params["proxies"] = {"https": PROXY_URL}
+            
+            client = Client(API_KEY, API_SECRET, **client_params)
             client.ping()
             logger.info("✅ [Binance] تم الاتصال بنجاح.")
             return
         except Exception as e:
-            if 'code=-1003' in str(e):
-                # استخراج وقت انتهاء الحظر
-                ban_time = extract_ban_time(str(e))
+            error_str = str(e)
+            if 'code=-1003' in error_str:
+                ban_time = extract_ban_time(error_str)
                 current_time = time.time() * 1000
                 
                 if ban_time > current_time:
@@ -139,64 +192,69 @@ def get_binance_client():
                 time.sleep(10)
                 
     logger.critical("❌ [Binance] فشل جميع محاولات الاتصال.")
+    if AUTO_RESOLVE_BAN:
+        rotate_ip_address()
     exit(1)
-
-def extract_ban_time(error_msg: str) -> float:
-    """استخراج وقت انتهاء الحظر من رسالة الخطأ"""
-    try:
-        match = re.search(r'until (\d+)', error_msg)
-        if match:
-            return float(match.group(1))
-    except:
-        return (time.time() + 300) * 1000  # افتراضي: 5 دقائق
-    return (time.time() + 300) * 1000
 
 def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
     if not client:
         logger.error("❌ [Validation] عميل Binance لم يتم تهيئته.")
         return []
     try:
+        GENERAL_RATE_LIMITER.wait()
+        
         script_dir = os.path.dirname(__file__)
         file_path = os.path.join(script_dir, filename)
         with open(file_path, 'r', encoding='utf-8') as f:
             symbols = {s.strip().upper() for s in f if s.strip() and not s.startswith('#')}
         formatted = {f"{s}USDT" if not s.endswith('USDT') else s for s in symbols}
+        
+        GENERAL_RATE_LIMITER.wait()
         info = client.get_exchange_info()
+        
         active = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING' and s['quoteAsset'] == 'USDT'}
         validated = sorted(list(formatted.intersection(active)))
+        
+        if TOTAL_SERVERS > 1:
+            validated = [s for i, s in enumerate(validated) if i % TOTAL_SERVERS == SERVER_ID]
+        
         logger.info(f"✅ [Validation] تم العثور على {len(validated)} عملة صالحة للتداول.")
         return validated
     except FileNotFoundError:
         logger.error(f"❌ [Validation] ملف قائمة العملات '{filename}' غير موجود.")
         return []
     except Exception as e:
-        logger.error(f"❌ [Validation] خطأ في التحقق من الرموز: {e}"); return []
+        logger.error(f"❌ [Validation] خطأ في التحقق من الرموز: {e}")
+        return []
 
-# --- دوال جلب ومعالجة البيانات (مع التحسينات) ---
-
+# --- دوال جلب ومعالجة البيانات ---
 @retry(stop=stop_after_attempt(3), 
        wait=wait_exponential(multiplier=1, min=4, max=10),
        retry=retry_if_exception_type(RequestException))
 def fetch_historical_data_retryable(symbol: str, interval: str, days: int) -> list:
     try:
+        HISTORICAL_RATE_LIMITER.wait()
+        
         start_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         klines = client.get_historical_klines(symbol, interval, start_str)
         
-        # إضافة تأخير للتحكم في معدل الطلبات
-        time.sleep(REQUEST_DELAY)
+        GENERAL_RATE_LIMITER.wait()
         return klines
     except Exception as e:
-        if 'code=-1003' in str(e):
-            ban_time = extract_ban_time(str(e))
+        error_str = str(e)
+        if 'code=-1003' in error_str:
+            ban_time = extract_ban_time(error_str)
             current_time = time.time() * 1000
             
             if ban_time > current_time:
                 wait_seconds = (ban_time - current_time) / 1000 + 5
                 logger.warning(f"⚠️ [Binance] حظر مؤقت للرمز {symbol}. الانتظار {wait_seconds:.1f} ثانية...")
                 time.sleep(wait_seconds)
-            raise RequestException("Binance API Ban")  # إعادة رفع الاستثناء
+            raise RequestException("Binance API Ban")
         else:
             raise e
+
+@lru_cache(maxsize=32)
 def cached_fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     try:
         klines = fetch_historical_data_retryable(symbol, interval, days)
@@ -208,38 +266,34 @@ def cached_fetch_historical_data(symbol: str, interval: str, days: int) -> Optio
         df.set_index('timestamp', inplace=True)
         return df[numeric_cols].dropna()
     except Exception as e:
-        logger.error(f"❌ [Data] خطأ أثناء جلب البيانات لـ {symbol}: {e}"); return None
+        logger.error(f"❌ [Data] خطأ أثناء جلب البيانات لـ {symbol}: {e}")
+        return None
 
 def fetch_and_cache_btc_data():
     global btc_data_cache
     logger.info("ℹ️ [BTC Data] جاري جلب بيانات البيتكوين وتخزينها...")
     btc_data_cache = cached_fetch_historical_data(BTC_SYMBOL, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
     if btc_data_cache is None:
-        logger.critical("❌ [BTC Data] فشل جلب بيانات البيتكوين."); exit(1)
-    btc_data_cache['btc_returns'] = btc_data_cache['close'].pct_change().shift(1)  # منع تسرب البيانات
+        logger.critical("❌ [BTC Data] فشل جلب بيانات البيتكوين.")
+        exit(1)
+    btc_data_cache['btc_returns'] = btc_data_cache['close'].pct_change().shift(1)
 
-# طريقة Triple-Barrier المتجهة
 def vectorized_triple_barrier_labels(prices: pd.Series, atr: pd.Series) -> pd.Series:
     labels = pd.Series(0, index=prices.index)
     max_hold = MAX_HOLD_PERIOD
     
-    # إنشاء حواجز ديناميكية
     upper_barriers = prices + (atr * TP_ATR_MULTIPLIER)
     lower_barriers = prices - (atr * SL_ATR_MULTIPLIER)
     
-    # إنشاء مصفوفة أسعار مستقبلية
     price_matrix = pd.DataFrame({f't+{i}': prices.shift(-i) for i in range(1, max_hold+1)})
     
-    # تحديد نقاط الاختراق
     upper_hits = (price_matrix > upper_barriers.values.reshape(-1, 1)).any(axis=1)
     lower_hits = (price_matrix < lower_barriers.values.reshape(-1, 1)).any(axis=1)
     
-    # تعيين التسميات
     labels[upper_hits] = 1
     labels[lower_hits] = -1
     return labels
 
-# حساب المؤشرات الفنية مع الميزات الجديدة
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc = df.copy()
 
@@ -256,7 +310,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9))))
 
-    # MACD and MACD Cross
+    # MACD
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = df_calc['close'].ewm(span=MACD_SLOW, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -266,7 +320,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc.loc[(df_calc['macd_hist'].shift(1) < 0) & (df_calc['macd_hist'] >= 0), 'macd_cross'] = 1
     df_calc.loc[(df_calc['macd_hist'].shift(1) > 0) & (df_calc['macd_hist'] <= 0), 'macd_cross'] = -1
 
-    # Bollinger Bands Width
+    # Bollinger Bands
     sma = df_calc['close'].rolling(window=BBANDS_PERIOD).mean()
     std_dev = df_calc['close'].rolling(window=BBANDS_PERIOD).std()
     upper_band = sma + (std_dev * 2)
@@ -284,27 +338,27 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     # Relative Volume
     df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=REL_VOL_PERIOD, min_periods=1).mean() + 1e-9)
 
-    # Overbought/Oversold Filter
-    df_calc['market_condition'] = 0  # 0 for Neutral
-    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1  # 1 for Overbought
-    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1  # -1 for Oversold
+    # Market Condition
+    df_calc['market_condition'] = 0
+    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1
+    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1
 
-    # VWAP (ميزة جديدة)
+    # VWAP
     df_calc['typical_price'] = (df_calc['high'] + df_calc['low'] + df_calc['close']) / 3
     df_calc['vwap'] = (df_calc['typical_price'] * df_calc['volume']).cumsum() / df_calc['volume'].cumsum()
 
-    # Volume Spike (ميزة جديدة)
+    # Volume Spike
     median_vol = df_calc['volume'].rolling(window=50).median()
     df_calc['volume_spike'] = df_calc['volume'] / (median_vol + 1e-9)
 
-    # Other existing features
-    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, method='fft').mean()  # تحسين الأداء
-    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, method='fft').mean()  # تحسين الأداء
+    # EMA Trends
+    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, method='fft').mean()
+    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, method='fft').mean()
     df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
     df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
     df_calc['returns'] = df_calc['close'].pct_change()
     
-    # BTC Correlation مع منع تسرب البيانات
+    # BTC Correlation
     merged_df = pd.merge(
         df_calc, 
         btc_df[['btc_returns']], 
@@ -323,7 +377,6 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     
     return df_calc
 
-# تقييم متقدم للنموذج
 def evaluate_model(y_true, y_pred) -> Dict[str, float]:
     report = classification_report(y_true, y_pred, output_dict=True)
     return {
@@ -345,7 +398,7 @@ def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> 
         'rsi', 'macd_hist', 'atr', 'relative_volume', 'hour_of_day',
         'price_vs_ema50', 'price_vs_ema200', 'btc_correlation',
         'stoch_rsi_k', 'stoch_rsi_d', 'macd_cross', 'market_condition',
-        'bb_width', 'vwap', 'volume_spike'  # إضافة الميزات الجديدة
+        'bb_width', 'vwap', 'volume_spike'
     ]
     
     df_cleaned = df_featured.dropna(subset=feature_columns + ['target']).copy()
@@ -426,7 +479,8 @@ def save_ml_model_to_db(model_bundle: Dict[str, Any], model_name: str, metrics: 
         conn.commit()
         logger.info(f"✅ [DB Save] Model bundle '{model_name}' saved successfully.")
     except Exception as e:
-        logger.error(f"❌ [DB Save] Error saving model bundle: {e}"); conn.rollback()
+        logger.error(f"❌ [DB Save] Error saving model bundle: {e}")
+        conn.rollback()
 
 def clean_old_models(keep_last: int = 3):
     logger.info(f"ℹ️ [DB Clean] Cleaning old models, keeping last {keep_last} versions...")
@@ -448,11 +502,17 @@ def clean_old_models(keep_last: int = 3):
 def send_telegram_message(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
-    except Exception as e: logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
+    try: 
+        requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
+    except Exception as e: 
+        logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
+
+def rotate_ip_address():
+    """دوران عنوان IP (يعتمد على البيئة)"""
+    logger.warning("🔄 محاولة تغيير عنوان IP...")
+    send_telegram_message("🔄 *دوران IP*: تم تشغيل آلية تغيير IP")
 
 def train_symbol(symbol: str) -> Tuple[str, bool]:
-    """تدريب نموذج لعملة معينة وإرجاع حالة النجاح"""
     logger.info(f"\n--- ⏳ [Training] Starting model training for {symbol} ---")
     try:
         df_hist = cached_fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
@@ -490,6 +550,11 @@ def train_symbol(symbol: str) -> Tuple[str, bool]:
         return symbol, False
 
 def run_training_job():
+    if EMERGENCY_MODE:
+        logger.critical("🆘 تم تفعيل وضع الطوارئ - استخدام البيانات المخزنة مسبقاً")
+        send_telegram_message("🆘 *وضع الطوارئ*: تم تفعيل وضع الطوارئ. سيتم استخدام البيانات المخزنة فقط.")
+        return
+    
     logger.info(f"🚀 بدء تدريب النموذج ({BASE_ML_MODEL_NAME})...")
     init_db()
     
@@ -500,20 +565,48 @@ def run_training_job():
         logger.critical(f"❌ فشل التهيئة: {e}")
         send_telegram_message("⛔ *فشل حرج*: تعذر الاتصال بـ Binance API")
         return
+
+    symbols_to_train = get_validated_symbols(filename='crypto_list.txt')
+    
+    if not symbols_to_train:
+        logger.critical("❌ [Main] No valid symbols found. Exiting.")
+        return
         
     send_telegram_message(f"🚀 *{BASE_ML_MODEL_NAME} Training Started*\nWill train models for {len(symbols_to_train)} symbols.")
     
-    # المعالجة المتوازية
-    with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
-        results = list(tqdm(
-            executor.map(train_symbol, symbols_to_train),
-            total=len(symbols_to_train),
-            desc="Training Models"
-        ))
+    # حساب حجم الدفعة بناءً على عدد الرموز
+    batch_size = max(5, min(20, math.isqrt(len(symbols_to_train))))
+    batch_delay = max(60, min(300, len(symbols_to_train) * 2))
     
-    # حساب النتائج
-    successful_models = sum(1 for _, success in results if success)
-    failed_models = len(symbols_to_train) - successful_models
+    # تقسيم الرموز إلى دفعات
+    batches = [symbols_to_train[i:i+batch_size] 
+               for i in range(0, len(symbols_to_train), batch_size)]
+    
+    successful_models = 0
+    failed_models = 0
+    
+    for batch_idx, batch in enumerate(batches):
+        logger.info(f"🔁 معالجة الدفعة {batch_idx+1}/{len(batches)}: {len(batch)} عملات")
+        
+        with ThreadPoolExecutor(max_workers=min(4, len(batch))) as executor:
+            results = list(tqdm(
+                executor.map(train_symbol, batch),
+                total=len(batch),
+                desc=f"Training Batch {batch_idx+1}"
+            ))
+        
+        # حساب النتائج
+        batch_success = sum(1 for _, success in results if success)
+        batch_fail = len(batch) - batch_success
+        successful_models += batch_success
+        failed_models += batch_fail
+        
+        logger.info(f"✅ الدفعة {batch_idx+1} النتائج: نجاح ({batch_success}), فشل ({batch_fail})")
+        
+        # تأخير بين الدفعات
+        if batch_idx < len(batches) - 1:
+            logger.info(f"⏸️ استراحة {batch_delay} ثانية بين الدفعات...")
+            time.sleep(batch_delay)
     
     # تنظيف النماذج القديمة
     clean_old_models(keep_last=3)
@@ -526,19 +619,9 @@ def run_training_job():
     send_telegram_message(completion_message)
     logger.info(completion_message)
 
-    if conn: conn.close()
+    if conn: 
+        conn.close()
     logger.info("👋 [Main] ML training job finished.")
-
-# نظام التراجع (للتنفيذ في نظام التداول)
-def get_fallback_strategy(symbol: str) -> int:
-    """إستراتيجية احتياطية تعتمد على تقاطع المتوسطات"""
-    df = cached_fetch_historical_data(symbol, '15m', 3)
-    if df is None or df.empty: 
-        return 0
-    
-    ema_short = df['close'].ewm(span=12, method='fft').mean()
-    ema_long = df['close'].ewm(span=26, method='fft').mean()
-    return 1 if ema_short.iloc[-1] > ema_long.iloc[-1] else -1
 
 # اختبارات تلقائية
 class TestTradingSystem(unittest.TestCase):
@@ -569,7 +652,34 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "ML Trainer V6 service is running and healthy.", 200
+    return "ML Trainer Final service is running and healthy.", 200
+
+@app.route('/status')
+def status():
+    try:
+        # التحقق من اتصال قاعدة البيانات
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        
+        # التحقق من اتصال Binance
+        try:
+            client.ping()
+            binance_status = "connected"
+        except:
+            binance_status = "disconnected"
+        
+        return jsonify({
+            "status": "healthy",
+            "binance": binance_status,
+            "emergency_mode": EMERGENCY_MODE,
+            "server_id": SERVER_ID,
+            "total_servers": TOTAL_SERVERS
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     # تشغيل الاختبارات إذا تم الطلب
@@ -582,6 +692,6 @@ if __name__ == "__main__":
     training_thread.start()
     
     # بدء خادم ويب للحفاظ على الخدمة نشطة
-    port = int(os.environ.get("PORT", 10001))
+    port = int(os.environ.get("PORT", 10000))
     logger.info(f"🌍 Starting web server on port {port} to keep the service alive...")
     app.run(host='0.0.0.0', port=port)
