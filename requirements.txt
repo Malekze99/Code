@@ -1,0 +1,13 @@
+requests
+pandas
+numpy
+psycopg2
+python-binance
+Flask
+python-decouple
+APScheduler
+scikit-learn
+waitress
+psycopg2-binary
+pandas_ta 
+ta
