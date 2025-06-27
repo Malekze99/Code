@@ -120,8 +120,8 @@ class BinanceRateLimiter:
             self.request_times.append(now)
 
 # تهيئة محددي المعدل
-HISTORICAL_RATE_LIMITER = BinanceRateLimiter(max_requests=3, per_seconds=60)
-GENERAL_RATE_LIMITER = BinanceRateLimiter(max_requests=10, per_seconds=60)
+HISTORICAL_RATE_LIMITER = BinanceRateLimiter(max_requests=2, per_seconds=60)
+GENERAL_RATE_LIMITER = BinanceRateLimiter(max_requests=2, per_seconds=60)
 
 # --- دوال الاتصال والتحقق ---
 def init_db():
