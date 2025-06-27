@@ -26,6 +26,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from imblearn.over_sampling import SMOTE
 import unittest
 from requests.exceptions import RequestException
+import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
