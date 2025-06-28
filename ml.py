@@ -6,6 +6,7 @@ import requests
 import re
 import math
 import threading
+import random
 import numpy as np
 import pandas as pd
 import psycopg2
@@ -380,20 +381,264 @@ def fetch_and_cache_btc_data():
         exit(1)
     btc_data_cache['btc_returns'] = btc_data_cache['close'].pct_change().shift(1)
 
-# ... (بقية الدوال مثل vectorized_triple_barrier_labels, calculate_features, إلخ تبقى كما هي) ...
-
-# ====================== تحسينات التدريب والدفعات ======================
-def dynamic_batch_size(total_symbols: int, current_usage: float) -> int:
-    """تحديد حجم الدفعة بشكل ديناميكي بناءً على حمل النظام"""
-    max_batch = 20
-    min_batch = 5
+def vectorized_triple_barrier_labels(prices: pd.Series, atr: pd.Series) -> pd.Series:
+    labels = pd.Series(0, index=prices.index)
+    max_hold = MAX_HOLD_PERIOD
     
-    if current_usage > 0.8 * MAX_REQUESTS_PER_MINUTE:
-        return max(min_batch, int(total_symbols * 0.1))
-    elif current_usage > 0.6 * MAX_REQUESTS_PER_MINUTE:
-        return max(min_batch, int(total_symbols * 0.2))
-    else:
-        return min(max_batch, int(total_symbols * 0.3))
+    upper_barriers = prices + (atr * TP_ATR_MULTIPLIER)
+    lower_barriers = prices - (atr * SL_ATR_MULTIPLIER)
+    
+    price_matrix = pd.DataFrame({f't+{i}': prices.shift(-i) for i in range(1, max_hold+1)})
+    
+    upper_hits = (price_matrix > upper_barriers.values.reshape(-1, 1)).any(axis=1)
+    lower_hits = (price_matrix < lower_barriers.values.reshape(-1, 1)).any(axis=1)
+    
+    labels[upper_hits] = 1
+    labels[lower_hits] = -1
+    return labels
+
+def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
+    df_calc = df.copy()
+
+    # ATR
+    high_low = df_calc['high'] - df_calc['low']
+    high_close = (df_calc['high'] - df_calc['close'].shift()).abs()
+    low_close = (df_calc['low'] - df_calc['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+
+    # RSI
+    delta = df_calc['close'].diff()
+    gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9))))
+
+    # MACD
+    ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = df_calc['close'].ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df_calc['macd_hist'] = macd_line - signal_line
+    df_calc['macd_cross'] = 0
+    df_calc.loc[(df_calc['macd_hist'].shift(1) < 0) & (df_calc['macd_hist'] >= 0), 'macd_cross'] = 1
+    df_calc.loc[(df_calc['macd_hist'].shift(1) > 0) & (df_calc['macd_hist'] <= 0), 'macd_cross'] = -1
+
+    # Bollinger Bands
+    sma = df_calc['close'].rolling(window=BBANDS_PERIOD).mean()
+    std_dev = df_calc['close'].rolling(window=BBANDS_PERIOD).std()
+    upper_band = sma + (std_dev * 2)
+    lower_band = sma - (std_dev * 2)
+    df_calc['bb_width'] = (upper_band - lower_band) / (sma + 1e-9)
+
+    # Stochastic RSI
+    rsi = df_calc['rsi']
+    min_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).min()
+    max_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).max()
+    stoch_rsi_val = (rsi - min_rsi) / (max_rsi - min_rsi).replace(0, 1e-9)
+    df_calc['stoch_rsi_k'] = stoch_rsi_val.rolling(window=STOCH_K).mean() * 100
+    df_calc['stoch_rsi_d'] = df_calc['stoch_rsi_k'].rolling(window=STOCH_D).mean()
+
+    # Relative Volume
+    df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=REL_VOL_PERIOD, min_periods=1).mean() + 1e-9)
+
+    # Market Condition
+    df_calc['market_condition'] = 0
+    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1
+    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1
+
+    # VWAP
+    df_calc['typical_price'] = (df_calc['high'] + df_calc['low'] + df_calc['close']) / 3
+    df_calc['vwap'] = (df_calc['typical_price'] * df_calc['volume']).cumsum() / df_calc['volume'].cumsum()
+
+    # Volume Spike
+    median_vol = df_calc['volume'].rolling(window=50).median()
+    df_calc['volume_spike'] = df_calc['volume'] / (median_vol + 1e-9)
+
+    # EMA Trends
+    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, method='fft').mean()
+    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, method='fft').mean()
+    df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
+    df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
+    df_calc['returns'] = df_calc['close'].pct_change()
+    
+    # BTC Correlation
+    merged_df = pd.merge(
+        df_calc, 
+        btc_df[['btc_returns']], 
+        left_index=True, 
+        right_index=True, 
+        how='left'
+    ).fillna(0)
+    merged_df['btc_returns_shifted'] = merged_df['btc_returns'].shift(1)
+    df_calc['btc_correlation'] = (
+        merged_df['returns']
+        .rolling(window=BTC_CORR_PERIOD)
+        .corr(merged_df['btc_returns_shifted'])
+    )
+    
+    df_calc['hour_of_day'] = df_calc.index.hour
+    
+    return df_calc
+
+def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Series, List[str]]]:
+    logger.info(f"ℹ️ [ML Prep] Preparing data for {symbol}...")
+    df_featured = calculate_features(df, btc_df)
+    df_featured['target'] = vectorized_triple_barrier_labels(df_featured['close'], df_featured['atr'])
+    
+    feature_columns = [
+        'rsi', 'macd_hist', 'atr', 'relative_volume', 'hour_of_day',
+        'price_vs_ema50', 'price_vs_ema200', 'btc_correlation',
+        'stoch_rsi_k', 'stoch_rsi_d', 'macd_cross', 'market_condition',
+        'bb_width', 'vwap', 'volume_spike'
+    ]
+    
+    df_cleaned = df_featured.dropna(subset=feature_columns + ['target']).copy()
+    if df_cleaned.empty or df_cleaned['target'].nunique() < 2:
+        logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Skipping.")
+        return None
+    
+    logger.info(f"📊 [ML Prep] Target distribution for {symbol}:\n{df_cleaned['target'].value_counts(normalize=True)}")
+    X = df_cleaned[feature_columns]
+    y = df_cleaned['target']
+    
+    # موازنة الفئات باستخدام SMOTE
+    if y.nunique() > 1:
+        smote = SMOTE(sampling_strategy={1: 1000, -1: 1000}, random_state=42)
+        X_res, y_res = smote.fit_resample(X, y)
+        return X_res, y_res, feature_columns
+    
+    return X, y, feature_columns
+
+def train_with_walk_forward_validation(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
+    logger.info("ℹ️ [ML Train] Starting training with Walk-Forward Validation...")
+    tscv = TimeSeriesSplit(n_splits=10)
+    final_model, final_scaler = None, None
+
+    for i, (train_index, test_index) in enumerate(tscv.split(X)):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+        
+        scaler = StandardScaler().fit(X_train)
+        X_train_scaled = pd.DataFrame(scaler.transform(X_train), columns=X.columns, index=X_train.index)
+        X_test_scaled = pd.DataFrame(scaler.transform(X_test), columns=X.columns, index=X_test.index)
+        
+        model = lgb.LGBMClassifier(
+            objective='multiclass', num_class=3, random_state=42, n_estimators=300,
+            learning_rate=0.05, class_weight='balanced', n_jobs=-1)
+        
+        model.fit(X_train_scaled, y_train, eval_set=[(X_test_scaled, y_test)],
+                  eval_metric='multi_logloss', callbacks=[lgb.early_stopping(30, verbose=False)])
+        
+        y_pred = model.predict(X_test_scaled)
+        metrics = evaluate_model(y_test, y_pred)
+        logger.info(f"--- Fold {i+1}: Accuracy: {metrics['accuracy']:.4f}, "
+                    f"F1(1): {metrics['f1_class_1']:.4f}, "
+                    f"F1(-1): {metrics['f1_class_-1']:.4f}, "
+                    f"MCC: {metrics['mcc']:.4f}")
+        
+        final_model, final_scaler = model, scaler
+
+    if not final_model or not final_scaler:
+        logger.error("❌ [ML Train] Training failed, no model was created.")
+        return None, None, None
+
+    all_preds = []
+    all_true = []
+    for _, test_index in tscv.split(X):
+        X_test_final = X.iloc[test_index]
+        y_test_final = y.iloc[test_index]
+        X_test_final_scaled = pd.DataFrame(final_scaler.transform(X_test_final), columns=X.columns, index=X_test_final.index)
+        all_preds.extend(final_model.predict(X_test_final_scaled))
+        all_true.extend(y_test_final)
+
+    model_metrics = evaluate_model(all_true, all_preds)
+    metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in model_metrics.items()])
+    logger.info(f"📊 [ML Train] Average Walk-Forward Performance: {metrics_log_str}")
+    return final_model, final_scaler, model_metrics
+
+def evaluate_model(y_true, y_pred) -> Dict[str, float]:
+    report = classification_report(y_true, y_pred, output_dict=True)
+    return {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'f1_class_1': f1_score(y_true, y_pred, labels=[1], average='macro'),
+        'f1_class_-1': f1_score(y_true, y_pred, labels=[-1], average='macro'),
+        'mcc': matthews_corrcoef(y_true, y_pred),
+        'precision_class_1': report['1']['precision'],
+        'recall_class_1': report['1']['recall'],
+        'num_samples_trained': len(y_true),
+    }
+
+def save_ml_model_to_db(model_bundle: Dict[str, Any], model_name: str, metrics: Dict[str, Any]):
+    logger.info(f"ℹ️ [DB Save] Saving model bundle '{model_name}'...")
+    try:
+        model_binary = pickle.dumps(model_bundle)
+        metrics_json = json.dumps(metrics)
+        with conn.cursor() as db_cur:
+            db_cur.execute("""
+                INSERT INTO ml_models (model_name, model_data, trained_at, metrics) 
+                VALUES (%s, %s, NOW(), %s) ON CONFLICT (model_name) DO UPDATE SET 
+                model_data = EXCLUDED.model_data, trained_at = NOW(), metrics = EXCLUDED.metrics;
+            """, (model_name, model_binary, metrics_json))
+        conn.commit()
+        logger.info(f"✅ [DB Save] Model bundle '{model_name}' saved successfully.")
+    except Exception as e:
+        logger.error(f"❌ [DB Save] Error saving model bundle: {e}")
+        conn.rollback()
+
+def clean_old_models(keep_last: int = 3):
+    logger.info(f"ℹ️ [DB Clean] Cleaning old models, keeping last {keep_last} versions...")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM ml_models 
+                WHERE id NOT IN (
+                    SELECT id FROM ml_models 
+                    ORDER BY trained_at DESC 
+                    LIMIT %s
+                )
+            """, (keep_last,))
+        conn.commit()
+        logger.info(f"✅ [DB Clean] Old models cleaned successfully.")
+    except Exception as e:
+        logger.error(f"❌ [DB Clean] Error cleaning old models: {e}")
+
+# ====================== دوال التدريب الرئيسية ======================
+def train_symbol(symbol: str) -> Tuple[str, bool]:
+    logger.info(f"\n--- ⏳ [Training] Starting model training for {symbol} ---")
+    try:
+        df_hist = cached_fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
+        if df_hist is None or df_hist.empty:
+            logger.warning(f"⚠️ [Training] No data for {symbol}, skipping.")
+            return symbol, False
+        
+        prepared_data = prepare_data_for_ml(df_hist, btc_data_cache, symbol)
+        if prepared_data is None:
+            return symbol, False
+            
+        X, y, feature_names = prepared_data
+        training_result = train_with_walk_forward_validation(X, y)
+        
+        if not all(training_result):
+            return symbol, False
+            
+        final_model, final_scaler, model_metrics = training_result
+        
+        # معايير الحفظ المحسنة
+        if (final_model and final_scaler and 
+            model_metrics.get('f1_class_1', 0) > 0.45 and 
+            model_metrics.get('mcc', 0) > 0.2):
+            
+            model_bundle = {'model': final_model, 'scaler': final_scaler, 'feature_names': feature_names}
+            model_name = f"{BASE_ML_MODEL_NAME}_{symbol}"
+            save_ml_model_to_db(model_bundle, model_name, model_metrics)
+            return symbol, True
+        else:
+            logger.warning(f"⚠️ [Training] Model for {symbol} doesn't meet quality standards. Discarding.")
+            return symbol, False
+            
+    except Exception as e:
+        logger.critical(f"❌ [Training] A fatal error occurred for {symbol}: {e}", exc_info=True)
+        return symbol, False
 
 def train_batch(batch: List[str]) -> Tuple[int, int]:
     """تدريب دفعة من الرموز مع التحكم الديناميكي"""
@@ -404,7 +649,10 @@ def train_batch(batch: List[str]) -> Tuple[int, int]:
     max_workers = min(4, len(batch))
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(train_symbol, symbol): symbol for symbol in batch}
+        # استخدام قائمة بدلاً من قاموس لتجنب مشاكل التعريف
+        futures = []
+        for symbol in batch:
+            futures.append(executor.submit(train_symbol, symbol))
         
         for future in futures:
             try:
@@ -418,6 +666,18 @@ def train_batch(batch: List[str]) -> Tuple[int, int]:
                 batch_fail += 1
     
     return batch_success, batch_fail
+
+def dynamic_batch_size(total_symbols: int, current_usage: float) -> int:
+    """تحديد حجم الدفعة بشكل ديناميكي بناءً على حمل النظام"""
+    max_batch = 20
+    min_batch = 5
+    
+    if current_usage > 0.8 * MAX_REQUESTS_PER_MINUTE:
+        return max(min_batch, int(total_symbols * 0.1))
+    elif current_usage > 0.6 * MAX_REQUESTS_PER_MINUTE:
+        return max(min_batch, int(total_symbols * 0.2))
+    else:
+        return min(max_batch, int(total_symbols * 0.3))
 
 def run_training_job():
     if EMERGENCY_MODE:
@@ -497,8 +757,6 @@ def run_training_job():
         conn.close()
     logger.info("👋 [Main] ML training job finished.")
 
-# ... (بقية الدوال مثل evaluate_model, prepare_data_for_ml, إلخ تبقى كما هي) ...
-
 # ====================== دوال إضافية للتحكم في النظام ======================
 def rotate_ip_address():
     """دوران عنوان IP (يعتمد على البيئة)"""
@@ -522,7 +780,29 @@ def send_telegram_message(text: str):
     except Exception as e: 
         logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
 
-# ... (بقية الكود مثل تطبيق Flask والاختبارات) ...
+# اختبارات تلقائية
+class TestTradingSystem(unittest.TestCase):
+    def test_triple_barrier(self):
+        prices = pd.Series([100, 102, 105, 103, 107, 110, 108])
+        atr = pd.Series([1.0, 1.1, 1.2, 1.0, 1.3, 1.1, 1.0])
+        labels = vectorized_triple_barrier_labels(prices, atr)
+        self.assertEqual(labels.tolist(), [1, 0, 1, 0, 1, 0, 0])
+    
+    def test_feature_engineering(self):
+        df = pd.DataFrame({
+            'open': [100, 101, 102, 101, 103],
+            'high': [105, 104, 106, 103, 107],
+            'low': [95, 98, 100, 99, 101],
+            'close': [102, 103, 105, 101, 106],
+            'volume': [1000, 1200, 800, 1500, 900]
+        }, index=pd.date_range('2023-01-01', periods=5, freq='15T'))
+        
+        btc_df = pd.DataFrame({'btc_returns': [0.01, -0.02, 0.03, -0.01, 0.02]}, index=df.index)
+        
+        featured_df = calculate_features(df, btc_df)
+        self.assertIn('vwap', featured_df.columns)
+        self.assertIn('volume_spike', featured_df.columns)
+        self.assertAlmostEqual(featured_df['vwap'].iloc[2], 102.333, places=1)
 
 # تطبيق Flask للحفاظ على الخدمة نشطة
 app = Flask(__name__)
