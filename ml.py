@@ -395,8 +395,6 @@ def vectorized_triple_barrier_labels(prices: pd.Series, atr: pd.Series) -> pd.Se
     
     labels[upper_hits] = 1
     labels[lower_hits] = -1
-    return labels
-
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc = df.copy()
 
@@ -454,9 +452,9 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     median_vol = df_calc['volume'].rolling(window=50).median()
     df_calc['volume_spike'] = df_calc['volume'] / (median_vol + 1e-9)
 
-    # EMA Trends
-    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, method='fft').mean()
-    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, method='fft').mean()
+    # EMA Trends - التصحيح هنا
+    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD).mean()
+    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD).mean()
     df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
     df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
     df_calc['returns'] = df_calc['close'].pct_change()
