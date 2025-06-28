@@ -837,7 +837,7 @@ class ScalpingTradingStrategy:
 
         return df_calc
 
-     def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
     logger.debug(f"ℹ️ [Strategy {self.symbol}] إنشاء إشارة شراء (تعتمد على ML فقط)...")
 
     min_signal_data_len = max(VOLUME_LOOKBACK_CANDLES, RSI_MOMENTUM_LOOKBACK_CANDLES, 55) + 1
@@ -950,7 +950,6 @@ class ScalpingTradingStrategy:
 
     logger.info(f"✅ [Strategy {self.symbol}] تم تأكيد إشارة الشراء (ML فقط). السعر: {current_price:.6f}, ATR: {current_atr:.6f}, الحجم: {volume_recent:,.0f}, تنبؤ ML: {ml_prediction_result_text}, BTC Trend Feature: {last_row.get('btc_trend_feature', 0.0)}")
     return signal_output
-
 
 # ---------------------- Telegram Functions ----------------------
 def send_telegram_message(target_chat_id: str, text: str, reply_markup: Optional[Dict] = None, parse_mode: str = 'Markdown', disable_web_page_preview: bool = True, timeout: int = 20) -> Optional[Dict]:
