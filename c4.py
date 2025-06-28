@@ -838,118 +838,117 @@ class ScalpingTradingStrategy:
         return df_calc
 
     def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    logger.debug(f"ℹ️ [Strategy {self.symbol}] إنشاء إشارة شراء (تعتمد على ML فقط)...")
+        logger.debug(f"ℹ️ [Strategy {self.symbol}] إنشاء إشارة شراء (تعتمد على ML فقط)...")
+        min_signal_data_len = max(VOLUME_LOOKBACK_CANDLES, RSI_MOMENTUM_LOOKBACK_CANDLES, 55) + 1
+        if df_processed is None or df_processed.empty or len(df_processed) < min_signal_data_len:
+            logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame فارغ أو قصير جدًا (<{min_signal_data_len})، لا يمكن إنشاء إشارة.")
+            return None
 
-    min_signal_data_len = max(VOLUME_LOOKBACK_CANDLES, RSI_MOMENTUM_LOOKBACK_CANDLES, 55) + 1
-    if df_processed is None or df_processed.empty or len(df_processed) < min_signal_data_len:
-        logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame فارغ أو قصير جدًا (<{min_signal_data_len})، لا يمكن إنشاء إشارة.")
-        return None
+        # استخدم قائمة الميزات من الحزمة إذا كانت متاحة، وإلا استخدم القائمة العامة
+        if self.ml_bundle and 'feature_names' in self.ml_bundle:
+            required_feature_columns = self.ml_bundle['feature_names']
+        else:
+            required_feature_columns = FEATURE_COLUMNS
 
-    # استخدم قائمة الميزات من الحزمة إذا كانت متاحة، وإلا استخدم القائمة العامة
-    if self.ml_bundle and 'feature_names' in self.ml_bundle:
-        required_feature_columns = self.ml_bundle['feature_names']
-    else:
-        required_feature_columns = FEATURE_COLUMNS
+        # تحقق من وجود الأعمدة المطلوبة
+        missing_cols = [col for col in required_feature_columns if col not in df_processed.columns]
+        if missing_cols:
+            logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame يفتقد أعمدة مطلوبة للإشارة: {missing_cols}.")
+            return None
 
-    # تحقق من وجود الأعمدة المطلوبة
-    missing_cols = [col for col in required_feature_columns if col not in df_processed.columns]
-    if missing_cols:
-        logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame يفتقد أعمدة مطلوبة للإشارة: {missing_cols}.")
-        return None
+        last_row = df_processed.iloc[-1]
+        current_price = ticker_data.get(self.symbol)
+        if current_price is None:
+            logger.warning(f"⚠️ [Strategy {self.symbol}] السعر الحالي غير متاح من بيانات التيكر. لا يمكن إنشاء إشارة.")
+            return None
 
-    last_row = df_processed.iloc[-1]
-    current_price = ticker_data.get(self.symbol)
-    if current_price is None:
-        logger.warning(f"⚠️ [Strategy {self.symbol}] السعر الحالي غير متاح من بيانات التيكر. لا يمكن إنشاء إشارة.")
-        return None
+        if last_row[required_feature_columns].isnull().values.any() or pd.isna(last_row.get('atr')):
+             logger.warning(f"⚠️ [Strategy {self.symbol}] البيانات التاريخية تحتوي على قيم NaN في أعمدة المؤشرات المطلوبة. لا يمكن إنشاء إشارة.")
+             return None
 
-    if last_row[required_feature_columns].isnull().values.any() or pd.isna(last_row.get('atr')):
-         logger.warning(f"⚠️ [Strategy {self.symbol}] البيانات التاريخية تحتوي على قيم NaN في أعمدة المؤشرات المطلوبة. لا يمكن إنشاء إشارة.")
-         return None
+        signal_details = {}
 
-    signal_details = {}
+        # --- ML Model Prediction (Primary decision maker) ---
+        ml_prediction_result_text = "N/A (نموذج غير محمل)"
+        ml_is_bullish = False
 
-    # --- ML Model Prediction (Primary decision maker) ---
-    ml_prediction_result_text = "N/A (نموذج غير محمل)"
-    ml_is_bullish = False
+        if self.ml_bundle:
+            try:
+                # استخراج الميزات بالترتيب المطلوب بواسطة النموذج
+                features_for_prediction = last_row[required_feature_columns].values.reshape(1, -1)
+                
+                # إنشاء DataFrame لضمان وجود أسماء الميزات (للتطابق مع السكالر)
+                features_df = pd.DataFrame(features_for_prediction, columns=required_feature_columns)
+                
+                scaled_features = self.ml_bundle['scaler'].transform(features_df)
+                ml_pred = self.ml_bundle['model'].predict(scaled_features)[0]
+                if ml_pred == 1:
+                    ml_is_bullish = True
+                    ml_prediction_result_text = 'صعودي ✅'
+                elif ml_pred == -1:
+                    ml_prediction_result_text = 'هابط قوي ❌'
+                else:
+                    ml_prediction_result_text = 'محايد ➖'
+                logger.info(f"✨ [Strategy {self.symbol}] تنبؤ نموذج ML: {ml_prediction_result_text}.")
+            except Exception as ml_err:
+                logger.error(f"❌ [Strategy {self.symbol}] خطأ في تنبؤ نموذج ML: {ml_err}", exc_info=True)
+                ml_prediction_result_text = "خطأ في التنبؤ (0)"
+        
+        signal_details['ML_Prediction'] = ml_prediction_result_text
+        signal_details['BTC_Trend_Feature_Value'] = last_row.get('btc_trend_feature', 0.0)
 
-    if self.ml_bundle:
-        try:
-            # استخراج الميزات بالترتيب المطلوب بواسطة النموذج
-            features_for_prediction = last_row[required_feature_columns].values.reshape(1, -1)
-            
-            # إنشاء DataFrame لضمان وجود أسماء الميزات (للتطابق مع السكالر)
-            features_df = pd.DataFrame(features_for_prediction, columns=required_feature_columns)
-            
-            scaled_features = self.ml_bundle['scaler'].transform(features_df)
-            ml_pred = self.ml_bundle['model'].predict(scaled_features)[0]
-            if ml_pred == 1:
-                ml_is_bullish = True
-                ml_prediction_result_text = 'صعودي ✅'
-            elif ml_pred == -1:
-                ml_prediction_result_text = 'هابط قوي ❌'
-            else:
-                ml_prediction_result_text = 'محايد ➖'
-            logger.info(f"✨ [Strategy {self.symbol}] تنبؤ نموذج ML: {ml_prediction_result_text}.")
-        except Exception as ml_err:
-            logger.error(f"❌ [Strategy {self.symbol}] خطأ في تنبؤ نموذج ML: {ml_err}", exc_info=True)
-            ml_prediction_result_text = "خطأ في التنبؤ (0)"
-    
-    signal_details['ML_Prediction'] = ml_prediction_result_text
-    signal_details['BTC_Trend_Feature_Value'] = last_row.get('btc_trend_feature', 0.0)
+        # فحص قوة المؤشرات الجديدة
+        rsi_strength = last_row.get('rsi_overbought_strength', 0)
+        stoch_strength = last_row.get('stoch_rsi_k_overbought_strength', 0)
+        
+        if rsi_strength < 5 or stoch_strength < 5:
+            logger.info(f"ℹ️ [Strategy {self.symbol}] قوة المؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})")
+            signal_details['Indicators_Strength_Check'] = f'فشل: قوة مؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})'
+            return None
 
-    # فحص قوة المؤشرات الجديدة
-    rsi_strength = last_row.get('rsi_overbought_strength', 0)
-    stoch_strength = last_row.get('stoch_rsi_k_overbought_strength', 0)
-    
-    if rsi_strength < 5 or stoch_strength < 5:
-        logger.info(f"ℹ️ [Strategy {self.symbol}] قوة المؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})")
-        signal_details['Indicators_Strength_Check'] = f'فشل: قوة مؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})'
-        return None
+        if not ml_is_bullish:
+            return None
+        
+        # --- Volume Check (Essential filter) ---
+        volume_recent = fetch_recent_volume(self.symbol, interval=SIGNAL_GENERATION_TIMEFRAME, num_candles=VOLUME_LOOKBACK_CANDLES)
+        if volume_recent < MIN_VOLUME_15M_USDT:
+            logger.info(f"ℹ️ [Strategy {self.symbol}] السيولة ({volume_recent:,.0f} USDT) أقل من الحد الأدنى المطلوب ({MIN_VOLUME_15M_USDT:,.0f} USDT). تم رفض الإشارة.")
+            signal_details['Volume_Check'] = f'فشل: سيولة غير كافية ({volume_recent:,.0f} USDT)'
+            return None
+        else:
+            signal_details['Volume_Check'] = f'نجاح: سيولة كافية ({volume_recent:,.0f} USDT)'
 
-    if not ml_is_bullish:
-        return None
-    
-    # --- Volume Check (Essential filter) ---
-    volume_recent = fetch_recent_volume(self.symbol, interval=SIGNAL_GENERATION_TIMEFRAME, num_candles=VOLUME_LOOKBACK_CANDLES)
-    if volume_recent < MIN_VOLUME_15M_USDT:
-        logger.info(f"ℹ️ [Strategy {self.symbol}] السيولة ({volume_recent:,.0f} USDT) أقل من الحد الأدنى المطلوب ({MIN_VOLUME_15M_USDT:,.0f} USDT). تم رفض الإشارة.")
-        signal_details['Volume_Check'] = f'فشل: سيولة غير كافية ({volume_recent:,.0f} USDT)'
-        return None
-    else:
-        signal_details['Volume_Check'] = f'نجاح: سيولة كافية ({volume_recent:,.0f} USDT)'
+        current_atr = last_row.get('atr')
+        if pd.isna(current_atr) or current_atr <= 0:
+             logger.warning(f"⚠️ [Strategy {self.symbol}] قيمة ATR غير صالحة ({current_atr}) لحساب الهدف. لا يمكن إنشاء إشارة.")
+             return None
 
-    current_atr = last_row.get('atr')
-    if pd.isna(current_atr) or current_atr <= 0:
-         logger.warning(f"⚠️ [Strategy {self.symbol}] قيمة ATR غير صالحة ({current_atr}) لحساب الهدف. لا يمكن إنشاء إشارة.")
-         return None
+        target_multiplier = ENTRY_ATR_MULTIPLIER
+        initial_target = current_price + (target_multiplier * current_atr)
 
-    target_multiplier = ENTRY_ATR_MULTIPLIER
-    initial_target = current_price + (target_multiplier * current_atr)
+        profit_margin_pct = ((initial_target / current_price) - 1) * 100 if current_price > 0 else 0
+        if profit_margin_pct < MIN_PROFIT_MARGIN_PCT:
+            logger.info(f"ℹ️ [Strategy {self.symbol}] هامش الربح ({profit_margin_pct:.2f}%) أقل من الحد الأدنى المطلوب ({MIN_PROFIT_MARGIN_PCT:.2f}%). تم رفض الإشارة.")
+            signal_details['Profit_Margin_Check'] = f'فشل: هامش ربح غير كافٍ ({profit_margin_pct:.2f}%)'
+            return None
+        else:
+            signal_details['Profit_Margin_Check'] = f'نجاح: هامش ربح كافٍ ({profit_margin_pct:.2f}%)'
 
-    profit_margin_pct = ((initial_target / current_price) - 1) * 100 if current_price > 0 else 0
-    if profit_margin_pct < MIN_PROFIT_MARGIN_PCT:
-        logger.info(f"ℹ️ [Strategy {self.symbol}] هامش الربح ({profit_margin_pct:.2f}%) أقل من الحد الأدنى المطلوب ({MIN_PROFIT_MARGIN_PCT:.2f}%). تم رفض الإشارة.")
-        signal_details['Profit_Margin_Check'] = f'فشل: هامش ربح غير كافٍ ({profit_margin_pct:.2f}%)'
-        return None
-    else:
-        signal_details['Profit_Margin_Check'] = f'نجاح: هامش ربح كافٍ ({profit_margin_pct:.2f}%)'
+        signal_output = {
+            'symbol': self.symbol,
+            'entry_price': float(f"{current_price:.8g}"),
+            'initial_target': float(f"{initial_target:.8g}"),
+            'current_target': float(f"{initial_target:.8g}"),
+            'r2_score': 1.0,
+            'strategy_name': 'Scalping_ML_Only',
+            'signal_details': signal_details,
+            'volume_15m': volume_recent,
+            'trade_value': TRADE_VALUE,
+            'total_possible_score': 1.0
+        }
 
-    signal_output = {
-        'symbol': self.symbol,
-        'entry_price': float(f"{current_price:.8g}"),
-        'initial_target': float(f"{initial_target:.8g}"),
-        'current_target': float(f"{initial_target:.8g}"),
-        'r2_score': 1.0,
-        'strategy_name': 'Scalping_ML_Only',
-        'signal_details': signal_details,
-        'volume_15m': volume_recent,
-        'trade_value': TRADE_VALUE,
-        'total_possible_score': 1.0
-    }
-
-    logger.info(f"✅ [Strategy {self.symbol}] تم تأكيد إشارة الشراء (ML فقط). السعر: {current_price:.6f}, ATR: {current_atr:.6f}, الحجم: {volume_recent:,.0f}, تنبؤ ML: {ml_prediction_result_text}, BTC Trend Feature: {last_row.get('btc_trend_feature', 0.0)}")
-    return signal_output
+        logger.info(f"✅ [Strategy {self.symbol}] تم تأكيد إشارة الشراء (ML فقط). السعر: {current_price:.6f}, ATR: {current_atr:.6f}, الحجم: {volume_recent:,.0f}, تنبؤ ML: {ml_prediction_result_text}, BTC Trend Feature: {last_row.get('btc_trend_feature', 0.0)}")
+        return signal_output
 
 # ---------------------- Telegram Functions ----------------------
 def send_telegram_message(target_chat_id: str, text: str, reply_markup: Optional[Dict] = None, parse_mode: str = 'Markdown', disable_web_page_preview: bool = True, timeout: int = 20) -> Optional[Dict]:
@@ -1332,7 +1331,7 @@ def webhook() -> Tuple[str, int]:
         return "Webhook not configured", 200
 
     if not request.is_json:
-        logger.warning("⚠️ [Flask] تم استلام طلب webhook غير JSON.")
+        logger.warning("⚠️ [Flask] تم استلبام طلب webhook غير JSON.")
         return "Invalid request format", 400
 
     try:
