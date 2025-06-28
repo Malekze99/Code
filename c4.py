@@ -71,6 +71,25 @@ TARGET_APPROACH_THRESHOLD_PCT: float = 0.005
 BINANCE_FEE_RATE: float = 0.001
 BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V5'
 
+# Constants from ML Training (for feature calculation consistency)
+BBANDS_PERIOD: int = 20
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+EMA_SLOW_PERIOD: int = 200
+EMA_FAST_PERIOD: int = 50
+BTC_CORR_PERIOD: int = 30
+STOCH_RSI_PERIOD: int = 14
+STOCH_K: int = 3
+STOCH_D: int = 3
+REL_VOL_PERIOD: int = 30
+RSI_OVERBOUGHT: int = 70
+RSI_OVERSOLD: int = 30
+STOCH_RSI_OVERBOUGHT: int = 80
+STOCH_RSI_OVERSOLD: int = 20
+RSI_EXTREME_OVERBOUGHT: int = 85
+RSI_EXTREME_OVERSOLD: int = 15
+STOCH_RSI_EXTREME_OVERBOUGHT: int = 95
+STOCH_RSI_EXTREME_OVERSOLD: int = 5
+
 # قائمة الميزات المحدثة مع المؤشرات الجديدة
 FEATURE_COLUMNS = [
     'rsi', 'macd_hist', 'atr', 'relative_volume', 'hour_of_day',
@@ -667,175 +686,136 @@ class ScalpingTradingStrategy:
             logger.info(f"✅ [Strategy {self.symbol}] تم تحميل حزمة نموذج ML بنجاح.")
 
     def populate_indicators(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        logger.debug(f"ℹ️ [Strategy {self.symbol}] حساب المؤشرات لنموذج ML...")
-        min_len_required = max(RSI_PERIOD, RSI_MOMENTUM_LOOKBACK_CANDLES, VOLUME_LOOKBACK_CANDLES, 55) + 5
+    logger.debug(f"ℹ️ [Strategy {self.symbol}] حساب المؤشرات لنموذج ML...")
+    min_len_required = max(RSI_PERIOD, RSI_MOMENTUM_LOOKBACK_CANDLES, VOLUME_LOOKBACK_CANDLES, 55) + 5
 
-        if len(df) < min_len_required:
-            logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame قصير جدًا ({len(df)} < {min_len_required}) لحساب مؤشرات ML.")
-            return None
+    if len(df) < min_len_required:
+        logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame قصير جدًا ({len(df)} < {min_len_required}) لحساب مؤشرات ML.")
+        return None
 
-        try:
-            df_calc = df.copy()
-            df_calc = calculate_rsi_indicator(df_calc, RSI_PERIOD)
-            df_calc = calculate_atr_indicator(df_calc, ENTRY_ATR_PERIOD)
-            df_calc['volume_15m_avg'] = df_calc['volume'].rolling(window=VOLUME_LOOKBACK_CANDLES, min_periods=1).mean()
-            df_calc['rsi_momentum_bullish'] = 0
-            if len(df_calc) >= RSI_MOMENTUM_LOOKBACK_CANDLES + 1:
-                for i in range(RSI_MOMENTUM_LOOKBACK_CANDLES, len(df_calc)):
-                    rsi_slice = df_calc['rsi'].iloc[i - RSI_MOMENTUM_LOOKBACK_CANDLES : i + 1]
-                    if not rsi_slice.isnull().any() and np.all(np.diff(rsi_slice) > 0) and rsi_slice.iloc[-1] > 50:
-                        df_calc.loc[df_calc.index[i], 'rsi_momentum_bullish'] = 1
-
-            btc_df = fetch_historical_data("BTCUSDT", interval=SIGNAL_GENERATION_TIMEFRAME, days=SIGNAL_GENERATION_LOOKBACK_DAYS)
-            btc_trend_series = None
-            if btc_df is not None and not btc_df.empty:
-                btc_trend_series = _calculate_btc_trend_feature(btc_df)
-                if btc_trend_series is not None:
-                    df_calc = df_calc.merge(btc_trend_series.rename('btc_trend_feature'),
-                                            left_index=True, right_index=True, how='left')
-                    df_calc['btc_trend_feature'] = df_calc['btc_trend_feature'].fillna(0.0)
-                    logger.debug(f"ℹ️ [Strategy {self.symbol}] تم دمج ميزة اتجاه البيتكوين.")
-                else:
-                    logger.warning(f"⚠️ [Strategy {self.symbol}] فشل حساب ميزة اتجاه البيتكوين. سيتم استخدام 0 كقيمة افتراضية لـ 'btc_trend_feature'.")
-                    df_calc['btc_trend_feature'] = 0.0
-            else:
-                logger.warning(f"⚠️ [Strategy {self.symbol}] فشل جلب البيانات التاريخية للبيتكوين. سيتم استخدام 0 كقيمة افتراضية لـ 'btc_trend_feature'.")
-                df_calc['btc_trend_feature'] = 0.0
-
-            if btc_df is None or btc_df.empty:
-                logger.warning(f"⚠️ [Strategy {self.symbol}] لا توجد بيانات BTC لتحديد ميزة الارتباط. سيتم استخدام 0.")
-                df_calc['btc_correlation'] = 0.0
-            else:
-                btc_df_for_corr = btc_df.copy()
-                btc_df_for_corr['btc_returns'] = btc_df_for_corr['close'].pct_change()
-                merged_df = df_calc.merge(btc_df_for_corr[['btc_returns']], left_index=True, right_index=True, how='left')
-                df_calc['btc_returns'] = merged_df['btc_returns'].fillna(0.0)
-                df_calc['returns'] = df_calc['close'].pct_change()
-                df_calc['btc_correlation'] = df_calc['returns'].rolling(window=30).corr(df_calc['btc_returns']).fillna(0.0)
-
-            df_calc = self.calculate_features(df_calc)
-
-            for col in FEATURE_COLUMNS:
-                if col not in df_calc.columns:
-                    logger.warning(f"⚠️ [Strategy {self.symbol}] عمود الميزة المفقود لنموذج ML: {col}")
-                    df_calc[col] = np.nan
-                else:
-                    df_calc[col] = pd.to_numeric(df_calc[col], errors='coerce')
-
-            initial_len = len(df_calc)
-            all_required_cols = list(set(FEATURE_COLUMNS + ['open', 'high', 'low', 'close', 'volume', 'atr']))
-            df_cleaned = df_calc.dropna(subset=all_required_cols).copy()
-            dropped_count = initial_len - len(df_cleaned)
-
-            if dropped_count > 0:
-                 logger.debug(f"ℹ️ [Strategy {self.symbol}] تم إسقاط {dropped_count} صفًا بسبب قيم NaN في المؤشرات.")
-            if df_cleaned.empty:
-                logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame فارغ بعد إزالة قيم NaN للمؤشرات.")
-                return None
-
-            latest = df_cleaned.iloc[-1]
-            logger.debug(f"✅ [Strategy {self.symbol}] تم حساب مؤشرات ML. أحدث حجم 15 دقيقة: {latest.get('volume_15m_avg', np.nan):.2f}, RSI Momentum: {latest.get('rsi_momentum_bullish', np.nan)}, BTC Trend: {latest.get('btc_trend_feature', np.nan)}, ATR: {latest.get('atr', np.nan):.4f}")
-            return df_cleaned
-
-        except KeyError as ke:
-             logger.error(f"❌ [Strategy {self.symbol}] خطأ: لم يتم العثور على عمود مطلوب أثناء حساب المؤشر: {ke}", exc_info=True)
-             return None
-        except Exception as e:
-            logger.error(f"❌ [Strategy {self.symbol}] خطأ غير متوقع أثناء حساب المؤشر: {e}", exc_info=True)
-            return None
-
-    def calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculates all the technical indicators required for the ML model including new features."""
+    try:
         df_calc = df.copy()
-
-        # ATR (already calculated in populate_indicators, so we skip if exists)
-        if 'atr' not in df_calc.columns:
-            high_low = df_calc['high'] - df_calc['low']
-            high_close_prev = (df_calc['high'] - df_calc['close'].shift(1)).abs()
-            low_close_prev = (df_calc['low'] - df_calc['close'].shift(1)).abs()
-            tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1, skipna=False)
-            df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
-
-        # RSI (already calculated in populate_indicators)
-        if 'rsi' not in df_calc.columns:
-            delta = df_calc['close'].diff()
-            gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-            loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-            df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9))))
-
-        # MACD and MACD Cross
-        if 'macd_hist' not in df_calc.columns or 'macd_cross' not in df_calc.columns:
-            ema_fast = df_calc['close'].ewm(span=12, adjust=False).mean()
-            ema_slow = df_calc['close'].ewm(span=26, adjust=False).mean()
-            macd_line = ema_fast - ema_slow
-            signal_line = macd_line.ewm(span=9, adjust=False).mean()
-            df_calc['macd_hist'] = macd_line - signal_line
-            df_calc['macd_cross'] = 0
-            df_calc.loc[(df_calc['macd_hist'].shift(1) < 0) & (df_calc['macd_hist'] >= 0), 'macd_cross'] = 1
-            df_calc.loc[(df_calc['macd_hist'].shift(1) > 0) & (df_calc['macd_hist'] <= 0), 'macd_cross'] = -1
-
-        # Bollinger Bands Width
-        if 'bb_width' not in df_calc.columns:
-            sma = df_calc['close'].rolling(window=20).mean()
-            std_dev = df_calc['close'].rolling(window=20).std()
-            upper_band = sma + (std_dev * 2)
-            lower_band = sma - (std_dev * 2)
-            df_calc['bb_width'] = (upper_band - lower_band) / (sma + 1e-9)
-
-        # Stochastic RSI
-        if 'stoch_rsi_k' not in df_calc.columns or 'stoch_rsi_d' not in df_calc.columns:
-            rsi = df_calc['rsi']
-            min_rsi = rsi.rolling(window=14).min()
-            max_rsi = rsi.rolling(window=14).max()
-            stoch_rsi_val = (rsi - min_rsi) / (max_rsi - min_rsi).replace(0, 1e-9)
-            df_calc['stoch_rsi_k'] = stoch_rsi_val.rolling(window=3).mean() * 100
-            df_calc['stoch_rsi_d'] = df_calc['stoch_rsi_k'].rolling(window=3).mean()
-
-        # Relative Volume
-        if 'relative_volume' not in df_calc.columns:
-            df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=30, min_periods=1).mean() + 1e-9)
-
-        # Overbought/Oversold Filter
-        if 'market_condition' not in df_calc.columns:
-            df_calc['market_condition'] = 0
-            df_calc.loc[(df_calc['rsi'] > 70) | (df_calc['stoch_rsi_k'] > 80), 'market_condition'] = 1
-            df_calc.loc[(df_calc['rsi'] < 30) | (df_calc['stoch_rsi_k'] < 20), 'market_condition'] = -1
-
-        # Other existing features
-        if 'price_vs_ema50' not in df_calc.columns:
-            ema_fast_trend = df_calc['close'].ewm(span=50, adjust=False).mean()
-            df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
-        if 'price_vs_ema200' not in df_calc.columns:
-            ema_slow_trend = df_calc['close'].ewm(span=200, adjust=False).mean()
-            df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
-
-        # 'btc_correlation' is already calculated in populate_indicators
-
-        # Hour of day
-        if 'hour_of_day' not in df_calc.columns:
-            df_calc['hour_of_day'] = df_calc.index.hour
-
-        # إضافة المؤشرات الجديدة
-        # RSI Extreme Overbought/Oversold
-        df_calc['rsi_extreme_overbought'] = (df_calc['rsi'] >= 85).astype(int)
-        df_calc['rsi_extreme_oversold'] = (df_calc['rsi'] <= 15).astype(int)
+        btc_df = fetch_historical_data("BTCUSDT", interval=SIGNAL_GENERATION_TIMEFRAME, days=SIGNAL_GENERATION_LOOKBACK_DAYS)
         
-        # Stoch RSI Extreme Overbought/Oversold
-        df_calc['stoch_rsi_extreme_overbought'] = (df_calc['stoch_rsi_k'] >= 95).astype(int)
-        df_calc['stoch_rsi_extreme_oversold'] = (df_calc['stoch_rsi_k'] <= 5).astype(int)
+        if btc_df is None or btc_df.empty:
+            logger.warning(f"⚠️ [Strategy {self.symbol}] فشل جلب بيانات البيتكوين.")
+            return None
         
-        # Strength of Overbought/Oversold
-        df_calc['rsi_overbought_strength'] = np.where(
-            df_calc['rsi'] > 70, df_calc['rsi'] - 70, 0)
-        df_calc['rsi_oversold_strength'] = np.where(
-            df_calc['rsi'] < 30, 30 - df_calc['rsi'], 0)
+        # تحضير بيانات البيتكوين
+        btc_df = btc_df.copy()
+        btc_df['btc_returns'] = btc_df['close'].pct_change()
         
-        df_calc['stoch_rsi_k_overbought_strength'] = np.where(
-            df_calc['stoch_rsi_k'] > 80, df_calc['stoch_rsi_k'] - 80, 0)
-        df_calc['stoch_rsi_k_oversold_strength'] = np.where(
-            df_calc['stoch_rsi_k'] < 20, 20 - df_calc['stoch_rsi_k'], 0)
+        # حساب الميزات الأساسية
+        df_calc = calculate_features(df_calc, btc_df[['btc_returns']])
+        
+        # حساب الميزات الإضافية
+        df_calc['volume_15m_avg'] = df_calc['volume'].rolling(window=VOLUME_LOOKBACK_CANDLES, min_periods=1).mean()
+        df_calc['rsi_momentum_bullish'] = 0
+        
+        if len(df_calc) >= RSI_MOMENTUM_LOOKBACK_CANDLES + 1:
+            for i in range(RSI_MOMENTUM_LOOKBACK_CANDLES, len(df_calc)):
+                rsi_slice = df_calc['rsi'].iloc[i - RSI_MOMENTUM_LOOKBACK_CANDLES : i + 1]
+                if not rsi_slice.isnull().any() and np.all(np.diff(rsi_slice) > 0) and rsi_slice.iloc[-1] > 50:
+                    df_calc.loc[df_calc.index[i], 'rsi_momentum_bullish'] = 1
 
-        return df_calc
+        btc_trend_series = _calculate_btc_trend_feature(btc_df)
+        if btc_trend_series is not None:
+            df_calc = df_calc.merge(btc_trend_series.rename('btc_trend_feature'),
+                                    left_index=True, right_index=True, how='left')
+            df_calc['btc_trend_feature'] = df_calc['btc_trend_feature'].fillna(0.0)
+        else:
+            df_calc['btc_trend_feature'] = 0.0
+
+        # تنظيف البيانات
+        all_required_cols = list(set(FEATURE_COLUMNS + ['open', 'high', 'low', 'close', 'volume', 'atr']))
+        df_cleaned = df_calc.dropna(subset=all_required_cols).copy()
+        
+        if df_cleaned.empty:
+            logger.warning(f"⚠️ [Strategy {self.symbol}] DataFrame فارغ بعد إزالة قيم NaN.")
+            return None
+
+        latest = df_cleaned.iloc[-1]
+        logger.debug(f"✅ [Strategy {self.symbol}] تم حساب المؤشرات بنجاح.")
+        return df_cleaned
+
+    except Exception as e:
+        logger.error(f"❌ [Strategy {self.symbol}] خطأ غير متوقع: {e}", exc_info=True)
+        return None
+
+    def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
+    df_calc = df.copy()
+    
+    # ATR
+    high_low = df_calc['high'] - df_calc['low']
+    high_close_prev = (df_calc['high'] - df_calc['close'].shift(1)).abs()
+    low_close_prev = (df_calc['low'] - df_calc['close'].shift(1)).abs()
+    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+    
+    # RSI
+    delta = df_calc['close'].diff()
+    gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9)))
+    
+    # MACD and MACD Cross
+    ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = df_calc['close'].ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df_calc['macd_hist'] = macd_line - signal_line
+    df_calc['macd_cross'] = 0
+    df_calc.loc[(df_calc['macd_hist'].shift(1) < 0) & (df_calc['macd_hist'] >= 0), 'macd_cross'] = 1
+    df_calc.loc[(df_calc['macd_hist'].shift(1) > 0) & (df_calc['macd_hist'] <= 0), 'macd_cross'] = -1
+
+    # Bollinger Bands Width
+    sma = df_calc['close'].rolling(window=BBANDS_PERIOD).mean()
+    std_dev = df_calc['close'].rolling(window=BBANDS_PERIOD).std()
+    upper_band = sma + (std_dev * 2)
+    lower_band = sma - (std_dev * 2)
+    df_calc['bb_width'] = (upper_band - lower_band) / (sma + 1e-9)
+
+    # Stochastic RSI
+    rsi = df_calc['rsi']
+    min_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).min()
+    max_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).max()
+    stoch_rsi_val = (rsi - min_rsi) / (max_rsi - min_rsi).replace(0, 1e-9)
+    df_calc['stoch_rsi_k'] = stoch_rsi_val.rolling(window=STOCH_K).mean() * 100
+    df_calc['stoch_rsi_d'] = df_calc['stoch_rsi_k'].rolling(window=STOCH_D).mean()
+
+    # Relative Volume
+    df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=REL_VOL_PERIOD, min_periods=1).mean() + 1e-9)
+
+    # Overbought/Oversold Filter
+    df_calc['market_condition'] = 0
+    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1
+    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1
+
+    # Price vs EMA
+    ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, adjust=False).mean()
+    ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, adjust=False).mean()
+    df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
+    df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
+    
+    # BTC Correlation
+    df_calc['returns'] = df_calc['close'].pct_change()
+    merged_df = pd.merge(df_calc, btc_df[['btc_returns']], left_index=True, right_index=True, how='left').fillna(0)
+    df_calc['btc_correlation'] = merged_df['returns'].rolling(window=BTC_CORR_PERIOD).corr(merged_df['btc_returns'])
+    
+    # Hour of Day
+    df_calc['hour_of_day'] = df_calc.index.hour
+    
+    # Extreme Overbought/Oversold Features
+    df_calc['rsi_extreme_overbought'] = (df_calc['rsi'] >= RSI_EXTREME_OVERBOUGHT).astype(int)
+    df_calc['rsi_extreme_oversold'] = (df_calc['rsi'] <= RSI_EXTREME_OVERSOLD).astype(int)
+    df_calc['stoch_rsi_extreme_overbought'] = (df_calc['stoch_rsi_k'] >= STOCH_RSI_EXTREME_OVERBOUGHT).astype(int)
+    df_calc['stoch_rsi_extreme_oversold'] = (df_calc['stoch_rsi_k'] <= STOCH_RSI_EXTREME_OVERSOLD).astype(int)
+    df_calc['rsi_overbought_strength'] = np.where(df_calc['rsi'] > RSI_OVERBOUGHT, df_calc['rsi'] - RSI_OVERBOUGHT, 0)
+    df_calc['rsi_oversold_strength'] = np.where(df_calc['rsi'] < RSI_OVERSOLD, RSI_OVERSOLD - df_calc['rsi'], 0)
+    df_calc['stoch_rsi_k_overbought_strength'] = np.where(df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT, df_calc['stoch_rsi_k'] - STOCH_RSI_OVERBOUGHT, 0)
+    df_calc['stoch_rsi_k_oversold_strength'] = np.where(df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD, STOCH_RSI_OVERSOLD - df_calc['stoch_rsi_k'], 0)
+    
+    return df_calc
 
     def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
         logger.debug(f"ℹ️ [Strategy {self.symbol}] إنشاء إشارة شراء (تعتمد على ML فقط)...")
