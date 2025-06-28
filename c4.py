@@ -837,7 +837,7 @@ class ScalpingTradingStrategy:
 
         return df_calc
 
- def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
+     def generate_buy_signal(self, df_processed: pd.DataFrame) -> Optional[Dict[str, Any]]:
     logger.debug(f"ℹ️ [Strategy {self.symbol}] إنشاء إشارة شراء (تعتمد على ML فقط)...")
 
     min_signal_data_len = max(VOLUME_LOOKBACK_CANDLES, RSI_MOMENTUM_LOOKBACK_CANDLES, 55) + 1
