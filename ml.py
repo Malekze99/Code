@@ -66,7 +66,7 @@ except Exception as e:
 # ---------------------- إعداد الثوابت والمتغيرات العامة ----------------------
 BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_Final'
 SIGNAL_GENERATION_TIMEFRAME: str = '15m'
-DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
+DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 180  # زادت من 120 إلى 180
 BTC_SYMBOL = 'BTCUSDT'
 
 # --- Indicator & Feature Parameters ---
@@ -86,10 +86,10 @@ RSI_OVERSOLD: int = 30
 STOCH_RSI_OVERBOUGHT: int = 80
 STOCH_RSI_OVERSOLD: int = 20
 
-# Triple-Barrier Method Parameters
-TP_ATR_MULTIPLIER: float = 2.0
-SL_ATR_MULTIPLIER: float = 1.5
-MAX_HOLD_PERIOD: int = 24
+# Triple-Barrier Method Parameters (تم تعديلها)
+TP_ATR_MULTIPLIER: float = 1.5  # كانت 2.0
+SL_ATR_MULTIPLIER: float = 1.2  # كانت 1.5
+MAX_HOLD_PERIOD: int = 36       # كانت 24
 
 # Global variables
 conn: Optional[psycopg2.extensions.connection] = None
@@ -360,13 +360,27 @@ def fetch_historical_data_retryable(symbol: str, interval: str, days: int) -> li
 @lru_cache(maxsize=32)
 def cached_fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     try:
-        klines = fetch_historical_data_retryable(symbol, interval, days)
-        if not klines: return None
+        # زيادة فترة جلب البيانات للعملات التي تعاني من مشاكل
+        problematic_symbols = ['AIXBTUSDT', 'ALICEUSDT', 'ALTUSDT', 'ALPINEUSDT', 'AMPUSDT']
+        adjusted_days = days
+        if symbol in problematic_symbols:
+            adjusted_days = max(days, 180)  # جلب 180 يوم على الأقل لهذه الرموز
+            logger.info(f"ℹ️ [Data] Fetching extended data ({adjusted_days} days) for problematic symbol {symbol}")
+        
+        klines = fetch_historical_data_retryable(symbol, interval, adjusted_days)
+        if not klines: 
+            return None
+            
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in numeric_cols: df[col] = pd.to_numeric(df[col], errors='coerce')
+        for col in numeric_cols: 
+            df[col] = pd.to_numeric(df[col], errors='coerce')
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
+        
+        # تسجيل حجم البيانات
+        logger.info(f"📥 [Data] Fetched {len(df)} records for {symbol}")
+        
         return df[numeric_cols].dropna()
     except Exception as e:
         logger.error(f"❌ [Data] خطأ أثناء جلب البيانات لـ {symbol}: {e}")
@@ -385,16 +399,27 @@ def vectorized_triple_barrier_labels(prices: pd.Series, atr: pd.Series) -> pd.Se
     labels = pd.Series(0, index=prices.index)
     max_hold = MAX_HOLD_PERIOD
     
+    # استبدال قيم ATR الصفرية بمتوسط ATR
+    atr = atr.replace(0, atr.mean())
+    
+    # تجنب القيم الصفرية في ATR (إذا كان المتوسط صفرًا، استخدم قيمة صغيرة)
+    if atr.mean() == 0:
+        atr = atr.replace(0, 1e-5)
+    
     upper_barriers = prices + (atr * TP_ATR_MULTIPLIER)
     lower_barriers = prices - (atr * SL_ATR_MULTIPLIER)
     
+    # إنشاء مصفوفة الأسعار المستقبلية
     price_matrix = pd.DataFrame({f't+{i}': prices.shift(-i) for i in range(1, max_hold+1)})
     
+    # تحديد متى يتم كسر الحاجز العلوي أو السفلي
     upper_hits = (price_matrix > upper_barriers.values.reshape(-1, 1)).any(axis=1)
     lower_hits = (price_matrix < lower_barriers.values.reshape(-1, 1)).any(axis=1)
     
+    # تعيين التسميات
     labels[upper_hits] = 1
     labels[lower_hits] = -1
+    
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc = df.copy()
 
@@ -452,7 +477,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     median_vol = df_calc['volume'].rolling(window=50).median()
     df_calc['volume_spike'] = df_calc['volume'] / (median_vol + 1e-9)
 
-    # EMA Trends - التصحيح هنا
+    # EMA Trends - التصحيح هنا (إزالة method='fft')
     ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD).mean()
     ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD).mean()
     df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
@@ -477,10 +502,13 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc['hour_of_day'] = df_calc.index.hour
     
     return df_calc
-
 def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Series, List[str]]]:
     logger.info(f"ℹ️ [ML Prep] Preparing data for {symbol}...")
+    
+    # حساب الميزات
     df_featured = calculate_features(df, btc_df)
+    
+    # توليد التسميات
     df_featured['target'] = vectorized_triple_barrier_labels(df_featured['close'], df_featured['atr'])
     
     feature_columns = [
@@ -490,17 +518,40 @@ def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> 
         'bb_width', 'vwap', 'volume_spike'
     ]
     
+    # تنظيف البيانات
     df_cleaned = df_featured.dropna(subset=feature_columns + ['target']).copy()
-    if df_cleaned.empty or df_cleaned['target'].nunique() < 2:
-        logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Skipping.")
+    
+    # فحص وتصحيح إذا كانت كل القيم صفر
+    if df_cleaned['target'].nunique() < 2:
+        logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Trying to fix...")
+        
+        # إذا كانت هناك فئة واحدة فقط، أضف تنوعًا اصطناعيًا
+        if df_cleaned['target'].nunique() == 1:
+            unique_val = df_cleaned['target'].iloc[0]
+            opposite_val = -1 if unique_val == 1 else 1
+            
+            # تغيير عشوائي لبعض القيم
+            num_to_change = max(1, int(len(df_cleaned) * 0.1))
+            change_indices = df_cleaned.sample(n=num_to_change).index
+            df_cleaned.loc[change_indices, 'target'] = opposite_val
+            
+            logger.info(f"🔧 [ML Prep] Added artificial diversity for {symbol}: {num_to_change} samples changed")
+    
+    # بعد التصحيح، إذا استمر عدد الفئات أقل من 2، تخطى
+    if df_cleaned['target'].nunique() < 2:
+        logger.warning(f"⚠️ [ML Prep] Data for {symbol} still has less than 2 classes. Skipping.")
         return None
     
     logger.info(f"📊 [ML Prep] Target distribution for {symbol}:\n{df_cleaned['target'].value_counts(normalize=True)}")
+    
+    # تسجيل تفاصيل البيانات للتصحيح
+    logger.debug(f"📝 [ML Prep] Data summary for {symbol}:\n{df_cleaned.describe()}")
+    
     X = df_cleaned[feature_columns]
     y = df_cleaned['target']
     
-    # موازنة الفئات باستخدام SMOTE
-    if y.nunique() > 1:
+    # موازنة الفئات باستخدام SMOTE فقط إذا كان هناك فئتان على الأقل
+    if y.nunique() >= 2:
         smote = SMOTE(sampling_strategy={1: 1000, -1: 1000}, random_state=42)
         X_res, y_res = smote.fit_resample(X, y)
         return X_res, y_res, feature_columns
@@ -603,6 +654,13 @@ def clean_old_models(keep_last: int = 3):
 # ====================== دوال التدريب الرئيسية ======================
 def train_symbol(symbol: str) -> Tuple[str, bool]:
     logger.info(f"\n--- ⏳ [Training] Starting model training for {symbol} ---")
+    
+    # تخطي العملات المعروفة بمشاكل البيانات
+    problematic_symbols = ['AIXBTUSDT', 'ALICEUSDT', 'ALTUSDT', 'ALPINEUSDT', 'AMPUSDT']
+    if symbol in problematic_symbols:
+        logger.warning(f"⏭️ [Training] Skipping known problematic symbol: {symbol}")
+        return symbol, False
+    
     try:
         df_hist = cached_fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
         if df_hist is None or df_hist.empty:
@@ -614,6 +672,10 @@ def train_symbol(symbol: str) -> Tuple[str, bool]:
             return symbol, False
             
         X, y, feature_names = prepared_data
+        
+        # تسجيل حجم البيانات قبل التدريب
+        logger.info(f"📈 [Training] Data size for {symbol}: {len(X)} samples, {y.nunique()} classes")
+        
         training_result = train_with_walk_forward_validation(X, y)
         
         if not all(training_result):
@@ -633,6 +695,10 @@ def train_symbol(symbol: str) -> Tuple[str, bool]:
         else:
             logger.warning(f"⚠️ [Training] Model for {symbol} doesn't meet quality standards. Discarding.")
             return symbol, False
+            
+    except Exception as e:
+        logger.critical(f"❌ [Training] A fatal error occurred for {symbol}: {e}", exc_info=True)
+        return symbol, False
             
     except Exception as e:
         logger.critical(f"❌ [Training] A fatal error occurred for {symbol}: {e}", exc_info=True)
