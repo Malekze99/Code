@@ -861,7 +861,9 @@ class ScalpingTradingStrategy:
                 features_df = pd.DataFrame(features_for_prediction, columns=required_feature_columns)
                 
                 scaled_features = self.ml_bundle['scaler'].transform(features_df)
-                ml_pred = self.ml_bundle['model'].predict(scaled_features)[0]
+                scaled_features_df = pd.DataFrame(scaled_features, columns=required_feature_columns)
+                ml_pred = self.ml_bundle['model'].predict(scaled_features_df)[0]  # تم الإصلاح هنا
+                
                 if ml_pred == 1:
                     ml_is_bullish = True
                     ml_prediction_result_text = 'صعودي ✅'
