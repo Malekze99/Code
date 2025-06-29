@@ -392,6 +392,10 @@ def check_db_connection() -> bool:
 def load_ml_model_from_db(symbol: str) -> Optional[Any]:
     global ml_models
     model_name = f"{BASE_ML_MODEL_NAME}_{symbol}"
+    # في دالة load_ml_model_from_db
+    if model_bundle:
+        logger.info(f"ميزات النموذج: {model_bundle['feature_names']}")
+        logger.info(f"عدد الأشجار: {model_bundle['model'].n_estimators}")
 
     if model_name in ml_models:
         logger.debug(f"ℹ️ [ML Model] النموذج '{model_name}' موجود بالفعل في الذاكرة.")
@@ -883,7 +887,7 @@ class ScalpingTradingStrategy:
         rsi_strength = last_row.get('rsi_overbought_strength', 0)
         stoch_strength = last_row.get('stoch_rsi_k_overbought_strength', 0)
         
-        if rsi_strength < 5 or stoch_strength < 5:
+        if rsi_strength < 5 and stoch_strength < 5:
             logger.info(f"ℹ️ [Strategy {self.symbol}] قوة المؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})")
             signal_details['Indicators_Strength_Check'] = f'فشل: قوة مؤشرات غير كافية (RSI: {rsi_strength}, Stoch: {stoch_strength})'
             return None
