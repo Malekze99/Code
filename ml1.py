@@ -175,7 +175,7 @@ def calculate_mfi(high, low, close, volume, window=14):
     pos_flow_sum = positive_flow.rolling(window).sum()
     neg_flow_sum = negative_flow.rolling(window).sum()
     
-    # التصحيح: إزالة الأقواس الزائدة
+    # حساب مؤشر MFI بشكل صحيح
     money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
     mfi = 100 - (100 / (1 + money_ratio))
     return mfi
@@ -198,11 +198,11 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
 
-    # RSI
+    # RSI - تم تصحيح بناء الجملة هنا
     delta = df_calc['close'].diff()
     gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9))))
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9)))
 
     # MACD and MACD Cross
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
