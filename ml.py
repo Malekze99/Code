@@ -175,8 +175,9 @@ def calculate_mfi(high, low, close, volume, window=14):
     pos_flow_sum = positive_flow.rolling(window).sum()
     neg_flow_sum = negative_flow.rolling(window).sum()
     
-    # تم إصلاح خطأ بناء الجملة هنا
-    mfi = 100 - (100 / (1 + (pos_flow_sum / (neg_flow_sum + 1e-9)))
+    # التصحيح: إزالة الأقواس الزائدة
+    money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
+    mfi = 100 - (100 / (1 + money_ratio))
     return mfi
 
 def calculate_cci(high, low, close, window=20):
