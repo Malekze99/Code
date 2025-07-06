@@ -14,25 +14,23 @@ from binance.client import Client
 from datetime import datetime, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Tuple
-from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
-from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from flask import Flask
 from threading import Thread
-from imblearn.over_sampling import ADASYN
-from scipy.stats import entropy
 
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('ml_model_trainer_v6.log', encoding='utf-8'),
+        logging.FileHandler('ml_model_trainer_v5.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('MLTrainer_V6')
+logger = logging.getLogger('MLTrainer_V5')
 
 # ---------------------- تحميل متغيرات البيئة ----------------------
 try:
@@ -46,7 +44,7 @@ except Exception as e:
      exit(1)
 
 # ---------------------- إعداد الثوابت والمتغيرات العامة ----------------------
-BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V6'
+BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V5'
 SIGNAL_GENERATION_TIMEFRAME: str = '15m'
 DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
 BTC_SYMBOL = 'BTCUSDT'
@@ -177,7 +175,9 @@ def calculate_mfi(high, low, close, volume, window=14):
     pos_flow_sum = positive_flow.rolling(window).sum()
     neg_flow_sum = negative_flow.rolling(window).sum()
     
-    mfi = 100 - (100 / (1 + (pos_flow_sum / (neg_flow_sum + 1e-9)))
+    # التصحيح: إزالة الأقواس الزائدة
+    money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
+    mfi = 100 - (100 / (1 + money_ratio))
     return mfi
 
 def calculate_cci(high, low, close, window=20):
@@ -202,7 +202,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     delta = df_calc['close'].diff()
     gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9)))))
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9))))
 
     # MACD and MACD Cross
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
@@ -338,6 +338,7 @@ def remove_outliers(df, columns, threshold=3):
 
 def balance_classes(X, y):
     """موازنة الفئات باستخدام تقنية ADASYN المتقدمة"""
+    from imblearn.over_sampling import ADASYN
     ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
     return ada.fit_resample(X, y)
 
@@ -534,7 +535,7 @@ def run_training_job():
     for symbol in symbols_to_train:
         logger.info(f"\n--- ⏳ [Main] Starting model training for {symbol} ---")
         try:
-            df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
+            df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, days=DATA_LOOKBACK_DAYS_FOR_TRAINING)
             if df_hist is None or df_hist.empty:
                 logger.warning(f"⚠️ [Main] No data for {symbol}, skipping."); failed_models += 1; continue
             
@@ -549,7 +550,7 @@ def run_training_job():
                 drift_score = detect_data_drift(reference_models[symbol], X)
                 logger.info(f"📈 [Drift] Data drift score for {symbol}: {drift_score:.4f}")
                 if drift_score > 0.25:
-                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f})")
+                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f}")
             
             # تدريب النموذج
             training_result = train_enhanced_model(X, y)
