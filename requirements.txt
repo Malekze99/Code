@@ -10,7 +10,7 @@ requests>=2.31.0
 Flask
 python-decouple
 APScheduler
-scikit-learn
+scikit-learn>=1.0.0
 waitress
 psycopg2-binary
 pandas_ta 
