@@ -198,11 +198,13 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
 
-    # RSI - تم تصحيح بناء الجملة هنا
+    # RSI - تم تصحيح بناء الجملة هنا بشكل نهائي
     delta = df_calc['close'].diff()
     gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-    df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9))))
+    loss_replaced = loss.replace(0, 1e-9)
+    rs = gain / loss_replaced
+    df_calc['rsi'] = 100 - (100 / (1 + rs))
 
     # MACD and MACD Cross
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
