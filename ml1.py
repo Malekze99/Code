@@ -107,7 +107,9 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
         logger.error("❌ [Validation] عميل Binance لم يتم تهيئته.")
         return []
     try:
-        script_dir = os.path.dirname(__file__)
+        # Note: This assumes the script is run from a directory containing 'crypto_list.txt'
+        # For more robust path handling, consider using absolute paths.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         file_path = os.path.join(script_dir, filename)
         with open(file_path, 'r', encoding='utf-8') as f:
             symbols = {s.strip().upper() for s in f if s.strip() and not s.startswith('#')}
@@ -174,21 +176,41 @@ def calculate_liquidity(close, volume):
     """قياس السيولة الفورية"""
     return (close.diff() / volume.replace(0, 1e-9)).rolling(3).mean()
 
-def calculate_adx(high, low, close, window=10):
+# --- ✅  الكود المُصحح ---
+def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 10) -> pd.Series:
     """حساب ADX مختصر للسكالب"""
     up = high.diff()
     down = -low.diff()
     
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    # تحويل np.where إلى pd.Series للحفاظ على دالة .rolling
+    plus_dm = pd.Series(
+        np.where((up > down) & (up > 0), up, 0.0), 
+        index=high.index
+    )
+    minus_dm = pd.Series(
+        np.where((down > up) & (down > 0), down, 0.0), 
+        index=high.index
+    )
     
-    tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift()), np.abs(low - close.shift())))
+    tr = pd.concat([
+        high - low, 
+        (high - close.shift()).abs(), 
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
     
     atr = tr.rolling(window).mean()
-    plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
     
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    # تجنب القسمة على صفر
+    safe_atr = atr.replace(0, 1e-9)
+    
+    # الآن ستعمل هذه الأسطر بدون مشاكل
+    plus_di = 100 * (plus_dm.rolling(window).mean() / safe_atr)
+    minus_di = 100 * (minus_dm.rolling(window).mean() / safe_atr)
+    
+    # تجنب القسمة على صفر في dx
+    dx_denominator = (plus_di + minus_di).replace(0, 1e-9)
+    dx = 100 * np.abs(plus_di - minus_di) / dx_denominator
+    
     adx = dx.rolling(window).mean()
     return adx
 
@@ -268,19 +290,30 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     
     return df_calc
 
+# --- ✅  الكود المُصحح ---
 def get_scalping_labels(close_prices: pd.Series) -> pd.Series:
     """وضع علامات متخصصة للتداول السكالب"""
     labels = pd.Series(0, index=close_prices.index)
     for i in tqdm(range(len(close_prices) - SCALP_MAX_HOLD), desc="Scalp Labeling", leave=False):
         entry = close_prices.iloc[i]
-        tp = entry * (1 + SCALP_TP)
-        sl = entry * (1 - SCALP_SL)
+        tp_price = entry * (1 + SCALP_TP)
+        sl_price = entry * (1 - SCALP_SL)
         
-        future_prices = close_prices.iloc[i+1:i+SCALP_MAX_HOLD+1]
-        if any(future_prices >= tp):
-            labels.iloc[i] = 1
-        elif any(future_prices <= sl):
-            labels.iloc[i] = -1
+        future_prices = close_prices.iloc[i+1 : i + SCALP_MAX_HOLD + 1]
+
+        # البحث عن أول شمعة تصل إلى TP أو SL
+        tp_hits = future_prices[future_prices >= tp_price]
+        sl_hits = future_prices[future_prices <= sl_price]
+
+        tp_time = tp_hits.index.min() if not tp_hits.empty else pd.NaT
+        sl_time = sl_hits.index.min() if not sl_hits.empty else pd.NaT
+
+        # تحديد النتيجة بناءً على أيهما حدث أولاً
+        if pd.notna(tp_time) and (pd.isna(sl_time) or tp_time < sl_time):
+            labels.iloc[i] = 1  # تم الوصول إلى TP أولاً
+        elif pd.notna(sl_time):
+            labels.iloc[i] = -1 # تم الوصول إلى SL أولاً
+            
     return labels
 
 def remove_outliers(df, columns, threshold=3):
@@ -320,6 +353,9 @@ def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> 
     # إزالة القيم المتطرفة
     df_cleaned = remove_outliers(df_cleaned, feature_columns)
     
+    # يجب أن تكون الفئة المستهدفة من نوع int للنموذج
+    df_cleaned['target'] = df_cleaned['target'].astype(int)
+
     if df_cleaned.empty or df_cleaned['target'].nunique() < 2:
         logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Skipping.")
         return None
@@ -353,15 +389,15 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
         'class_weight': ['balanced', None]
     }
     
-    best_model = None
-    best_scaler = None
+    best_model_from_cv = None
+    best_scaler_from_cv = None
     best_score = -np.inf
     
     for fold, (train_index, val_index) in enumerate(tscv.split(X)):
         X_train, X_val = X.iloc[train_index], X.iloc[val_index]
         y_train, y_val = y.iloc[train_index], y.iloc[val_index]
         
-        # المعايرة
+        # المعايرة الصحيحة (تجنب تسرب البيانات)
         scaler = StandardScaler().fit(X_train)
         X_train_scaled = scaler.transform(X_train)
         X_val_scaled = scaler.transform(X_val)
@@ -369,7 +405,7 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
         # البحث العشوائي عن أفضل معلمات
         model = lgb.LGBMClassifier(objective='multiclass', num_class=3, random_state=42)
         random_search = RandomizedSearchCV(
-            model, param_dist, n_iter=25, cv=3, scoring='f1_weighted', n_jobs=-1
+            model, param_dist, n_iter=25, cv=3, scoring='f1_weighted', n_jobs=-1, random_state=42
         )
         random_search.fit(X_train_scaled, y_train)
         
@@ -380,37 +416,42 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
         logger.info(f"🔍 [Fold {fold+1}] Best params: {random_search.best_params_}, Score: {score:.4f}")
         
         if score > best_score:
-            best_model = random_search.best_estimator_
-            best_scaler = scaler
+            best_model_from_cv = random_search.best_estimator_
+            best_scaler_from_cv = scaler # حفظ أفضل scaler من الحلقة
             best_score = score
     
-    if not best_model or not best_scaler:
+    if not best_model_from_cv or not best_scaler_from_cv:
         logger.error("❌ [ML Train] Training failed, no model was created.")
         return None, None, None
     
     # تدريب النموذج النهائي على كامل البيانات
-    X_full_scaled = best_scaler.transform(X)
-    best_model.fit(X_full_scaled, y)
+    # 1. معايرة كامل البيانات
+    final_scaler = StandardScaler().fit(X)
+    X_full_scaled = final_scaler.transform(X)
+    
+    # 2. تدريب النموذج النهائي بأفضل المعلمات التي تم العثور عليها
+    final_model = best_model_from_cv
+    final_model.fit(X_full_scaled, y)
     
     # حساب المقاييس النهائية
-    y_pred = best_model.predict(X_full_scaled)
+    y_pred = final_model.predict(X_full_scaled)
     final_report = classification_report(y, y_pred, output_dict=True, zero_division=0)
     
     avg_metrics = {
         'accuracy': accuracy_score(y, y_pred),
         'f1_weighted': f1_score(y, y_pred, average='weighted'),
-        'precision_1': precision_score(y, y_pred, labels=[1], average='binary'),
-        'recall_1': recall_score(y, y_pred, labels=[1], average='binary'),
-        'precision_-1': precision_score(y, y_pred, labels=[-1], average='binary'),
-        'recall_-1': recall_score(y, y_pred, labels=[-1], average='binary'),
+        'precision_1': precision_score(y, y_pred, labels=[1], average='binary', zero_division=0),
+        'recall_1': recall_score(y, y_pred, labels=[1], average='binary', zero_division=0),
+        'precision_-1': precision_score(y, y_pred, labels=[-1], average='binary', zero_division=0),
+        'recall_-1': recall_score(y, y_pred, labels=[-1], average='binary', zero_division=0),
         'num_samples_trained': len(X),
-        'best_params': random_search.best_params_
+        'best_params': best_model_from_cv.get_params()
     }
     
     metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in avg_metrics.items() if isinstance(v, float)])
     logger.info(f"📊 [ML Train] Final Model Performance: {metrics_log_str}")
     
-    return best_model, best_scaler, avg_metrics
+    return final_model, final_scaler, avg_metrics
 
 def detect_data_drift(X_ref: pd.DataFrame, X_current: pd.DataFrame) -> float:
     """كشف انجراح البيانات باستخدام تقنية Kullback-Leibler"""
@@ -440,7 +481,8 @@ def save_ml_model_to_db(model_bundle: Dict[str, Any], model_name: str, metrics: 
     logger.info(f"ℹ️ [DB Save] Saving model bundle '{model_name}'...")
     try:
         model_binary = pickle.dumps(model_bundle)
-        metrics_json = json.dumps(metrics)
+        # تحويل القيم التي لا يمكن تحويلها لـ JSON
+        metrics_json = json.dumps(metrics, default=str)
         with conn.cursor() as db_cur:
             db_cur.execute("""
                 INSERT INTO ml_models (model_name, model_data, trained_at, metrics) 
@@ -459,30 +501,40 @@ def send_telegram_message(text: str):
     except Exception as e: logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
 
 # ---------------------- نظام تنفيذ السكالب ----------------------
+# --- ✅  الكود المُصحح ---
 def scalp_alert_system(prediction, probabilities):
     """نظام تنبيهات ذكي للتداول السكالب"""
-    if probabilities[1] > 0.7:  # ثقة عالية في الصفقة
-        if prediction == 1:
-            return "إشارة شراء قوية"
-        elif prediction == -1:
-            return "إشارة بيع قوية"
-    elif probabilities[0] > 0.6:  # ثقة عالية في الحياد
+    # الفئات هي [-1, 0, 1] لذا الاحتمالات تكون بالترتيب [P(-1), P(0), P(1)]
+    # P(بيع), P(حياد), P(شراء)
+    prob_sell = probabilities[0]
+    prob_neutral = probabilities[1]
+    prob_buy = probabilities[2]
+    
+    if prob_buy > 0.7 and prediction == 1:
+        return "إشارة شراء قوية"
+    elif prob_sell > 0.7 and prediction == -1:
+        return "إشارة بيع قوية"
+    elif prob_neutral > 0.6:
         return "الانتظار أفضل"
+        
     return "لا إشارة واضحة"
 
 def execute_scalp_trade(signal, symbol, price, model_name):
     """تنفيذ صفقات السكالب التلقائية"""
-    tp_price = price * (1 + SCALP_TP)
-    sl_price = price * (1 - SCALP_SL)
+    tp_price_buy = price * (1 + SCALP_TP)
+    sl_price_buy = price * (1 - SCALP_SL)
+    
+    tp_price_sell = price * (1 - SCALP_TP)
+    sl_price_sell = price * (1 + SCALP_SL)
     
     if signal == "إشارة شراء قوية":
         # تنفيذ أمر شراء مع وقف الخسارة وجني الربح
-        msg = f"📈 [Trade] شراء {symbol} عند {price:.4f} | TP: {tp_price:.4f} | SL: {sl_price:.4f}"
+        msg = f"📈 [Trade] شراء {symbol} عند {price:.4f} | TP: {tp_price_buy:.4f} | SL: {sl_price_buy:.4f}"
         logger.info(msg)
         send_telegram_message(f"*{model_name}*\n{msg}")
     elif signal == "إشارة بيع قوية":
         # تنفيذ أمر بيع مع وقف الخسارة وجني الربح
-        msg = f"📉 [Trade] بيع {symbol} عند {price:.4f} | TP: {tp_price:.4f} | SL: {sl_price:.4f}"
+        msg = f"📉 [Trade] بيع {symbol} عند {price:.4f} | TP: {tp_price_sell:.4f} | SL: {sl_price_sell:.4f}"
         logger.info(msg)
         send_telegram_message(f"*{model_name}*\n{msg}")
 
@@ -520,7 +572,7 @@ def run_training_job():
                 drift_score = detect_data_drift(reference_models[symbol], X)
                 logger.info(f"📈 [Drift] Data drift score for {symbol}: {drift_score:.4f}")
                 if drift_score > 0.25:
-                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f}")
+                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f})")
             
             # تدريب النموذج
             training_result = train_enhanced_model(X, y)
@@ -582,3 +634,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10001))
     logger.info(f"🌍 Starting web server on port {port} to keep the service alive...")
     app.run(host='0.0.0.0', port=port)
+
