@@ -8,7 +8,6 @@ import pandas as pd
 import psycopg2
 import pickle
 import lightgbm as lgb
-import pandas_ta as ta  # <-- تم الإضافة
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from binance.client import Client
@@ -29,11 +28,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('ml_model_trainer_v5_improved.log', encoding='utf-8'),
+        logging.FileHandler('ml_scalp_trainer_v6.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('MLTrainer_V5_Improved')
+logger = logging.getLogger('MLScalpTrainer_V6')
 
 # ---------------------- تحميل متغيرات البيئة ----------------------
 try:
@@ -46,40 +45,40 @@ except Exception as e:
      logger.critical(f"❌ فشل في تحميل المتغيرات البيئية الأساسية: {e}")
      exit(1)
 
-# ---------------------- إعداد الثوابت والمتغيرات العامة ----------------------
-BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V5_Improved'
-SIGNAL_GENERATION_TIMEFRAME: str = '15m'
-DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
+# ---------------------- إعداد ثوابت السكالب ----------------------
+BASE_ML_MODEL_NAME: str = 'LightGBM_Scalper_V6'
+SIGNAL_GENERATION_TIMEFRAME: str = '5m'  # تغيير إلى 5 دقائق للتداول السكالب
+DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 90
 BTC_SYMBOL = 'BTCUSDT'
 
-# --- Indicator & Feature Parameters ---
+# --- معلمات السكالب ---
+SCALP_TP = 0.015  # هدف ربح 1.5%
+SCALP_SL = 0.007   # وقف خسارة 0.7%
+SCALP_MAX_HOLD = 8 # أقصى مدة احتفاظ (8 بارات = 40 دقيقة)
+
+# --- معالم المؤشرات ---
 BBANDS_PERIOD: int = 20
-RSI_PERIOD: int = 14
-MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
-ATR_PERIOD: int = 14
-EMA_SLOW_PERIOD: int = 200
-EMA_FAST_PERIOD: int = 50
-BTC_CORR_PERIOD: int = 30
-STOCH_RSI_PERIOD: int = 14
+RSI_PERIOD: int = 9
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 8, 17, 6
+ATR_PERIOD: int = 10
+EMA_SLOW_PERIOD: int = 100
+EMA_FAST_PERIOD: int = 20
+BTC_CORR_PERIOD: int = 20
+STOCH_RSI_PERIOD: int = 10
 STOCH_K: int = 3
 STOCH_D: int = 3
-REL_VOL_PERIOD: int = 30
-RSI_OVERBOUGHT: int = 70
-RSI_OVERSOLD: int = 30
-STOCH_RSI_OVERBOUGHT: int = 80
-STOCH_RSI_OVERSOLD: int = 20
+REL_VOL_PERIOD: int = 20
+RSI_OVERBOUGHT: int = 75
+RSI_OVERSOLD: int = 25
+STOCH_RSI_OVERBOUGHT: int = 85
+STOCH_RSI_OVERSOLD: int = 15
 
-# Triple-Barrier Method Parameters
-TP_ATR_MULTIPLIER: float = 2.0
-SL_ATR_MULTIPLIER: float = 1.5
-MAX_HOLD_PERIOD: int = 24
-
-# Global variables
+# متغيرات عامة
 conn: Optional[psycopg2.extensions.connection] = None
 client: Optional[Client] = None
 btc_data_cache: Optional[pd.DataFrame] = None
 
-# --- دوال الاتصال والتحقق ---
+# ---------------------- دوال المساعدة الأساسية ----------------------
 def init_db():
     global conn
     try:
@@ -109,8 +108,7 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
         logger.error("❌ [Validation] عميل Binance لم يتم تهيئته.")
         return []
     try:
-        # تعديل طفيف ليكون أكثر قوة إذا تم تشغيله من مسارات مختلفة
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = os.path.dirname(__file__)
         file_path = os.path.join(script_dir, filename)
         with open(file_path, 'r', encoding='utf-8') as f:
             symbols = {s.strip().upper() for s in f if s.strip() and not s.startswith('#')}
@@ -126,7 +124,7 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
     except Exception as e:
         logger.error(f"❌ [Validation] خطأ في التحقق من الرموز: {e}"); return []
 
-# --- دوال جلب ومعالجة البيانات ---
+# ---------------------- دوال جلب ومعالجة البيانات ----------------------
 def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     try:
         start_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -134,8 +132,7 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
         if not klines: return None
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in numeric_cols: 
-            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+        for col in numeric_cols: df[col] = pd.to_numeric(df[col], errors='coerce')
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df[numeric_cols].dropna()
@@ -150,171 +147,187 @@ def fetch_and_cache_btc_data():
         logger.critical("❌ [BTC Data] فشل جلب بيانات البيتكوين."); exit(1)
     btc_data_cache['btc_returns'] = btc_data_cache['close'].pct_change()
 
-# --- دوال حساب المؤشرات (تم التحديث) ---
+# ---------------------- مؤشرات السكالب المتقدمة ----------------------
+def calculate_price_velocity(close_prices, period=3):
+    """حساب سرعة تحرك السعر"""
+    returns = close_prices.pct_change()
+    return returns.rolling(period).mean() * 100
+
+def calculate_buying_pressure(high, low, close):
+    """قياس ضغط المشترين"""
+    bp = (close - low) / (high - low + 1e-9)
+    return bp.replace([np.inf, -np.inf], 0).clip(0, 1) * 100
+
+def calculate_reversal_signal(open, high, low, close):
+    """كشف إشارات الانعكاس الفورية"""
+    # شموع المطرقة (Hammer) لإشارة الشراء
+    hammer = (close > open) & ((close - low) > 1.5 * (high - close)) & ((open - low) > (high - open))
+    # شموع الرجل المشنوق (Shooting Star) لإشارة البيع
+    shooting_star = (close < open) & ((high - open) > 1.5 * (open - low)) & ((high - close) > (close - low))
+    return np.where(hammer, 1, np.where(shooting_star, -1, 0))
+
+def calculate_fair_value(high, low, volume):
+    """تقدير القيمة العادلة الآنية"""
+    typical_price = (high + low) / 2
+    return (typical_price * volume).rolling(5).mean() / volume.rolling(5).mean()
+
+def calculate_liquidity(close, volume):
+    """قياس السيولة الفورية"""
+    return (close.diff() / volume.replace(0, 1e-9)).rolling(3).mean()
+
+def calculate_adx(high, low, close, window=10):
+    """حساب ADX مختصر للسكالب"""
+    up = high.diff()
+    down = -low.diff()
+    
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    
+    tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift()), np.abs(low - close.shift())))
+    
+    atr = tr.rolling(window).mean()
+    plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
+    
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(window).mean()
+    return adx
+
+# ---------------------- دوال معالجة البيانات ----------------------
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    نسخة محسنة من دالة حساب الميزات باستخدام مكتبة pandas-ta لضمان الدقة والكفاءة.
-    """
-    df_calc = df.copy(deep=True)
-    
-    # --- 1. حساب المؤشرات الفنية باستخدام pandas-ta ---
-    df_calc.ta.atr(length=ATR_PERIOD, append=True)
-    df_calc.ta.rsi(length=RSI_PERIOD, append=True)
-    df_calc.ta.macd(fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL, append=True)
-    df_calc.ta.bbands(length=BBANDS_PERIOD, append=True)
-    df_calc.ta.stochrsi(length=STOCH_RSI_PERIOD, rsi_length=RSI_PERIOD, k=STOCH_K, d=STOCH_D, append=True)
-    df_calc.ta.adx(length=ADX_PERIOD, append=True)
-    df_calc.ta.mfi(length=14, append=True)
-    df_calc.ta.cci(length=20, append=True)
-    df_calc.ta.vwap(append=True)
+    df_calc = df.copy()
 
-    # --- 2. إعادة تسمية الأعمدة لتناسب باقي الكود ---
-    df_calc.rename(columns={
-        f'ATR_{ATR_PERIOD}': 'atr',
-        f'RSI_{RSI_PERIOD}': 'rsi',
-        f'MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}': 'macd_hist',
-        f'STOCHRSIk_{STOCH_RSI_PERIOD}_{RSI_PERIOD}_{STOCH_K}_{STOCH_D}': 'stoch_rsi_k',
-        f'STOCHRSId_{STOCH_RSI_PERIOD}_{RSI_PERIOD}_{STOCH_K}_{STOCH_D}': 'stoch_rsi_d',
-        f'ADX_{ADX_PERIOD}': 'adx',
-        f'DMP_{ADX_PERIOD}': 'adx_pos',
-        f'DMN_{ADX_PERIOD}': 'adx_neg',
-        'MFI_14': 'mfi',
-        'CCI_20_0.015': 'cci',
-        f'VWAP_D': 'vwap' # قد يختلف الاسم حسب pandas-ta
-    }, inplace=True, errors='ignore')
+    # ATR
+    high_low = df_calc['high'] - df_calc['low']
+    high_close = (df_calc['high'] - df_calc['close'].shift()).abs()
+    low_close = (df_calc['low'] - df_calc['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df_calc['atr'] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
 
-    # --- 3. حساب الميزات المخصصة الأخرى ---
-    
-    # MACD Cross
+    # RSI مختصر
+    delta = df_calc['close'].diff()
+    gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9))))
+
+    # MACD سريع
+    ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = df_calc['close'].ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df_calc['macd_hist'] = macd_line - signal_line
     df_calc['macd_cross'] = 0
     df_calc.loc[(df_calc['macd_hist'].shift(1) < 0) & (df_calc['macd_hist'] >= 0), 'macd_cross'] = 1
     df_calc.loc[(df_calc['macd_hist'].shift(1) > 0) & (df_calc['macd_hist'] <= 0), 'macd_cross'] = -1
-    
-    # Bollinger Bands Width
-    bb_upper_col = f'BBU_{BBANDS_PERIOD}_2.0'
-    bb_lower_col = f'BBL_{BBANDS_PERIOD}_2.0'
-    bb_middle_col = f'BBM_{BBANDS_PERIOD}_2.0'
-    if all(col in df_calc.columns for col in [bb_upper_col, bb_lower_col, bb_middle_col]):
-        df_calc['bb_width'] = (df_calc[bb_upper_col] - df_calc[bb_lower_col]) / (df_calc[bb_middle_col] + 1e-9)
-    else:
-        df_calc['bb_width'] = 0 # Fallback
+
+    # Bollinger Bands
+    sma = df_calc['close'].rolling(window=BBANDS_PERIOD).mean()
+    std_dev = df_calc['close'].rolling(window=BBANDS_PERIOD).std()
+    df_calc['bb_width'] = (std_dev * 2) / (sma + 1e-9)
+
+    # Stochastic RSI
+    rsi = df_calc['rsi']
+    min_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).min()
+    max_rsi = rsi.rolling(window=STOCH_RSI_PERIOD).max()
+    stoch_rsi_val = (rsi - min_rsi) / (max_rsi - min_rsi).replace(0, 1e-9)
+    df_calc['stoch_rsi_k'] = stoch_rsi_val.rolling(window=STOCH_K).mean() * 100
 
     # Relative Volume
     df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=REL_VOL_PERIOD, min_periods=1).mean() + 1e-9)
 
-    # Market Condition Filter
-    df_calc['market_condition'] = 0  # 0 for Neutral
-    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1  # 1 for Overbought
-    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1  # -1 for Oversold
+    # Overbought/Oversold Filter
+    df_calc['market_condition'] = 0  # Neutral
+    df_calc.loc[(df_calc['rsi'] > RSI_OVERBOUGHT) | (df_calc['stoch_rsi_k'] > STOCH_RSI_OVERBOUGHT), 'market_condition'] = 1  # Overbought
+    df_calc.loc[(df_calc['rsi'] < RSI_OVERSOLD) | (df_calc['stoch_rsi_k'] < STOCH_RSI_OVERSOLD), 'market_condition'] = -1  # Oversold
 
-    # Other Features
+    # مؤشرات الاتجاه
     ema_fast_trend = df_calc['close'].ewm(span=EMA_FAST_PERIOD, adjust=False).mean()
     ema_slow_trend = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, adjust=False).mean()
-    df_calc['price_vs_ema50'] = (df_calc['close'] / ema_fast_trend) - 1
-    df_calc['price_vs_ema200'] = (df_calc['close'] / ema_slow_trend) - 1
-    df_calc['returns'] = df_calc['close'].pct_change()
+    df_calc['price_vs_ema20'] = (df_calc['close'] / ema_fast_trend) - 1
+    df_calc['price_vs_ema100'] = (df_calc['close'] / ema_slow_trend) - 1
     
+    # مؤشرات الربحية
+    df_calc['returns'] = df_calc['close'].pct_change()
     merged_df = pd.merge(df_calc, btc_df[['btc_returns']], left_index=True, right_index=True, how='left').fillna(0)
     df_calc['btc_correlation'] = merged_df['returns'].rolling(window=BTC_CORR_PERIOD).corr(merged_df['btc_returns'])
-    df_calc['hour_of_day'] = df_calc.index.hour
-    df_calc['volatility'] = df_calc['close'].pct_change().rolling(14).std()
-
-    # Interaction Features
-    df_calc['rsi_macd_interaction'] = df_calc['rsi'] * df_calc['macd_hist']
-    df_calc['atr_volume_interaction'] = df_calc['atr'] * df_calc['relative_volume']
+    df_calc['minute_of_hour'] = df_calc.index.minute  # دقيقة الساعة
+    
+    # مؤشرات السكالب الجديدة
+    df_calc['price_velocity'] = calculate_price_velocity(df_calc['close'])
+    df_calc['buying_pressure'] = calculate_buying_pressure(df_calc['high'], df_calc['low'], df_calc['close'])
+    df_calc['reversal_signal'] = calculate_reversal_signal(df_calc['open'], df_calc['high'], df_calc['low'], df_calc['close'])
+    df_calc['fair_value'] = calculate_fair_value(df_calc['high'], df_calc['low'], df_calc['volume'])
+    df_calc['liquidity'] = calculate_liquidity(df_calc['close'], df_calc['volume'])
+    df_calc['adx'] = calculate_adx(df_calc['high'], df_calc['low'], df_calc['close'])
+    
+    # تفاعلات متقدمة
+    df_calc['velocity_pressure'] = df_calc['price_velocity'] * df_calc['buying_pressure']
+    df_calc['reversal_volume'] = df_calc['reversal_signal'] * df_calc['relative_volume']
+    
+    # التقلب السريع
+    df_calc['volatility'] = df_calc['close'].pct_change().rolling(5).std()
     
     return df_calc
 
-def get_enhanced_labels(prices: pd.Series, atr: pd.Series, volatility: pd.Series) -> pd.Series:
-    """وضع علامات متقدمة باستخدام تقنية Triple-Barrier المعززة"""
-    prices = pd.Series(prices)
-    atr = pd.Series(atr)
-    volatility = pd.Series(volatility)
-    
-    labels = pd.Series(0, index=prices.index)
-    volatility_factor = 1 + (volatility.rolling(14).std() * 0.5)
-    volatility_factor = volatility_factor.fillna(1)
-    
-    # تحذير: هذه الدالة بطيئة بسبب الحلقات. التحسين باستخدام vectorization ممكن ولكنه معقد.
-    for i in tqdm(range(len(prices) - MAX_HOLD_PERIOD), desc="Enhanced Labeling", leave=False):
-        entry_price = prices.iloc[i]
-        current_atr = atr.iloc[i]
-        vol_factor = volatility_factor.iloc[i] if not pd.isna(volatility_factor.iloc[i]) else 1
+def get_scalping_labels(close_prices: pd.Series) -> pd.Series:
+    """وضع علامات متخصصة للتداول السكالب"""
+    labels = pd.Series(0, index=close_prices.index)
+    for i in tqdm(range(len(close_prices) - SCALP_MAX_HOLD), desc="Scalp Labeling", leave=False):
+        entry = close_prices.iloc[i]
+        tp = entry * (1 + SCALP_TP)
+        sl = entry * (1 - SCALP_SL)
         
-        if pd.isna(current_atr) or current_atr == 0: 
-            continue
-            
-        tp_level = entry_price + (current_atr * TP_ATR_MULTIPLIER * vol_factor)
-        sl_level = entry_price - (current_atr * SL_ATR_MULTIPLIER * vol_factor)
-        
-        best_gain = -np.inf
-        worst_loss = np.inf
-        
-        for j in range(1, MAX_HOLD_PERIOD + 1):
-            if i + j >= len(prices): 
-                break
-                
-            current_price = prices.iloc[i + j]
-            
-            gain = (current_price - entry_price) / entry_price
-            if gain > best_gain: best_gain = gain
-                
-            loss = (current_price - entry_price) / entry_price
-            if loss < worst_loss: worst_loss = loss
-                
-            if current_price >= tp_level:
-                labels.iloc[i] = 1; break
-            if current_price <= sl_level:
-                labels.iloc[i] = -1; break
-        else:
-            if best_gain > abs(worst_loss) and best_gain > 0.005:
-                labels.iloc[i] = 1
-            elif abs(worst_loss) > best_gain and abs(worst_loss) > 0.005:
-                labels.iloc[i] = -1
-                
+        future_prices = close_prices.iloc[i+1:i+SCALP_MAX_HOLD+1]
+        if any(future_prices >= tp):
+            labels.iloc[i] = 1
+        elif any(future_prices <= sl):
+            labels.iloc[i] = -1
     return labels
 
 def remove_outliers(df, columns, threshold=3):
     """إزالة القيم المتطرفة باستخدام تقنية Z-Score القوية"""
-    df_out = df.copy()
     for col in columns:
-        if pd.api.types.is_numeric_dtype(df_out[col]):
-            median = df_out[col].median()
-            mad = np.abs(df_out[col] - median).median()
-            if mad == 0: continue
-            z_score = 0.6745 * (df_out[col] - median) / mad
-            df_out = df_out[np.abs(z_score) < threshold]
-    return df_out
+        median = df[col].median()
+        mad = np.abs(df[col] - median).median()
+        if mad == 0:  # تجنب القسمة على صفر
+            continue
+        z_score = 0.6745 * (df[col] - median) / mad
+        df = df[np.abs(z_score) < threshold]
+    return df
 
 def balance_classes(X, y):
     """موازنة الفئات باستخدام تقنية ADASYN المتقدمة"""
-    try:
-        ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
-        return ada.fit_resample(X, y)
-    except Exception as e:
-        logger.warning(f"⚠️ [ADASYN] فشل في موازنة الفئات: {e}. سيتم استخدام البيانات الأصلية.")
-        return X, y
+    ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
+    return ada.fit_resample(X, y)
 
 def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Series, List[str]]]:
     logger.info(f"ℹ️ [ML Prep] Preparing data for {symbol}...")
     df_featured = calculate_features(df, btc_df)
     
-    df_featured['target'] = get_enhanced_labels(df_featured['close'], df_featured['atr'], df_featured['volatility'])
+    # وضع العلامات للسكالب
+    df_featured['target'] = get_scalping_labels(df_featured['close'])
     
     feature_columns = [
-        'rsi', 'macd_hist', 'atr', 'relative_volume', 'hour_of_day',
-        'price_vs_ema50', 'price_vs_ema200', 'btc_correlation',
-        'stoch_rsi_k', 'stoch_rsi_d', 'macd_cross', 'market_condition',
-        'bb_width', 'adx', 'adx_pos', 'adx_neg', 'mfi', 'vwap', 'cci', 
-        'volatility', 'rsi_macd_interaction', 'atr_volume_interaction'
+        # المؤشرات الأساسية
+        'rsi', 'macd_hist', 'atr', 'relative_volume', 'minute_of_hour',
+        'price_vs_ema20', 'price_vs_ema100', 'btc_correlation',
+        'stoch_rsi_k', 'macd_cross', 'market_condition', 'bb_width',
+        
+        # مؤشرات السكالب الجديدة
+        'price_velocity', 'buying_pressure', 'reversal_signal',
+        'fair_value', 'liquidity', 'adx', 'volatility',
+        
+        # التفاعلات المتقدمة
+        'velocity_pressure', 'reversal_volume'
     ]
     
     df_cleaned = df_featured.dropna(subset=feature_columns + ['target']).copy()
     
+    # إزالة القيم المتطرفة
     df_cleaned = remove_outliers(df_cleaned, feature_columns)
     
     if df_cleaned.empty or df_cleaned['target'].nunique() < 2:
-        logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes after prep. Skipping.")
+        logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Skipping.")
         return None
         
     logger.info(f"📊 [ML Prep] Target distribution for {symbol}:\n{df_cleaned['target'].value_counts(normalize=True)}")
@@ -324,48 +337,51 @@ def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> 
     
     return X, y, feature_columns
 
-# --- دوال التدريب المتقدمة (تم التحديث) ---
+# ---------------------- دوال التدريب المتقدمة ----------------------
 def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
-    """
-    تدريب متقدم باستخدام البحث العشوائي الآمن للسلاسل الزمنية وموازنة الفئات.
-    """
-    logger.info("ℹ️ [ML Train] Starting advanced model training...")
+    """تدريب متقدم للسكالب باستخدام البحث العشوائي"""
+    logger.info("ℹ️ [ML Train] Starting advanced scalping model training...")
     
-    X_bal, y_bal = balance_classes(X.values, y.values)
+    # موازنة الفئات
+    X_bal, y_bal = balance_classes(X, y)
     
-    # مقسم بيانات للسلاسل الزمنية للتقييم الخارجي
+    # تقسيم البيانات مع التحقق من التسرب الزمني
     tscv = TimeSeriesSplit(n_splits=5)
     
+    # معايرة المعلمات باستخدام البحث العشوائي
     param_dist = {
-        'learning_rate': [0.01, 0.05, 0.1], 'n_estimators': [300, 500, 700],
-        'max_depth': [3, 5, 7], 'subsample': [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8, 0.9], 'reg_alpha': [0, 0.1, 0.5], 'reg_lambda': [0, 0.1, 0.5]
+        'learning_rate': [0.05, 0.1, 0.15],
+        'n_estimators': [300, 500, 700],
+        'max_depth': [3, 5],
+        'subsample': [0.7, 0.8],
+        'colsample_bytree': [0.7, 0.8],
+        'reg_alpha': [0, 0.1],
+        'reg_lambda': [0, 0.1],
+        'min_child_samples': [10, 20],
+        'num_leaves': [31, 63]
     }
     
     best_model = None
     best_scaler = None
     best_score = -np.inf
-    best_params_overall = {}
     
     for fold, (train_index, val_index) in enumerate(tscv.split(X_bal)):
-        X_train, X_val = X_bal[train_index], X_bal[val_index]
-        y_train, y_val = y_bal[train_index], y_bal[val_index]
+        X_train, X_val = X_bal.iloc[train_index], X_bal.iloc[val_index]
+        y_train, y_val = y_bal.iloc[train_index], y_bal.iloc[val_index]
         
+        # المعايرة
         scaler = StandardScaler().fit(X_train)
         X_train_scaled = scaler.transform(X_train)
         X_val_scaled = scaler.transform(X_val)
         
-        model = lgb.LGBMClassifier(objective='multiclass', num_class=3, random_state=42, n_jobs=1)
-        
-        # --- الإصلاح الجوهري: استخدام TimeSeriesSplit داخل RandomizedSearchCV ---
-        # هذا يمنع تسرب البيانات أثناء البحث عن أفضل المعلمات.
-        inner_cv_splitter = TimeSeriesSplit(n_splits=3)
+        # البحث العشوائي عن أفضل معلمات
+        model = lgb.LGBMClassifier(objective='multiclass', num_class=3, random_state=42)
         random_search = RandomizedSearchCV(
-            estimator=model, param_distributions=param_dist, n_iter=15, 
-            cv=inner_cv_splitter, scoring='f1_weighted', n_jobs=-1, random_state=42
+            model, param_dist, n_iter=25, cv=3, scoring='f1_weighted', n_jobs=-1
         )
         random_search.fit(X_train_scaled, y_train)
         
+        # تقييم النموذج
         val_preds = random_search.best_estimator_.predict(X_val_scaled)
         score = f1_score(y_val, val_preds, average='weighted')
         
@@ -375,48 +391,53 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
             best_model = random_search.best_estimator_
             best_scaler = scaler
             best_score = score
-            best_params_overall = random_search.best_params_
     
     if not best_model or not best_scaler:
         logger.error("❌ [ML Train] Training failed, no model was created.")
         return None, None, None
     
-    logger.info(f"✅ [ML Train] Best model selected with F1-score: {best_score:.4f}")
-    
-    # تدريب النموذج النهائي على كامل البيانات الموزونة باستخدام أفضل المعلمات
+    # تدريب النموذج النهائي على كامل البيانات
     X_full_scaled = best_scaler.transform(X_bal)
     best_model.fit(X_full_scaled, y_bal)
     
+    # حساب المقاييس النهائية
     y_pred = best_model.predict(X_full_scaled)
     final_report = classification_report(y_bal, y_pred, output_dict=True, zero_division=0)
     
-    metrics = {
+    avg_metrics = {
         'accuracy': accuracy_score(y_bal, y_pred),
         'f1_weighted': f1_score(y_bal, y_pred, average='weighted'),
-        'precision_1': precision_score(y_bal, y_pred, labels=[1], average='binary', zero_division=0),
-        'recall_1': recall_score(y_bal, y_pred, labels=[1], average='binary', zero_division=0),
-        'precision_-1': precision_score(y_bal, y_pred, labels=[-1], average='binary', zero_division=0),
-        'recall_-1': recall_score(y_bal, y_pred, labels=[-1], average='binary', zero_division=0),
+        'precision_1': precision_score(y_bal, y_pred, labels=[1], average='binary'),
+        'recall_1': recall_score(y_bal, y_pred, labels=[1], average='binary'),
+        'precision_-1': precision_score(y_bal, y_pred, labels=[-1], average='binary'),
+        'recall_-1': recall_score(y_bal, y_pred, labels=[-1], average='binary'),
         'num_samples_trained': len(X_bal),
-        'best_params': best_params_overall
+        'best_params': random_search.best_params_
     }
     
-    metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in metrics.items() if isinstance(v, float)])
+    metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in avg_metrics.items() if isinstance(v, float)])
     logger.info(f"📊 [ML Train] Final Model Performance: {metrics_log_str}")
     
-    return best_model, best_scaler, metrics
+    return best_model, best_scaler, avg_metrics
 
 def detect_data_drift(X_ref: pd.DataFrame, X_current: pd.DataFrame) -> float:
-    """كشف انجراف البيانات باستخدام تقنية Kullback-Leibler"""
+    """كشف انجراح البيانات باستخدام تقنية Kullback-Leibler"""
     kl_divergences = []
     for col in X_ref.columns:
         try:
+            # إنشاء سلال متوافقة للبيانات المرجعية والجارية
             combined = pd.concat([X_ref[col], X_current[col]])
             bins = np.histogram_bin_edges(combined, bins=50)
+            
+            # حساب التوزيعات
             p, _ = np.histogram(X_ref[col], bins=bins, density=True)
             q, _ = np.histogram(X_current[col], bins=bins, density=True)
+            
+            # تجنب القيم الصفرية
             p = np.clip(p, 1e-10, None)
             q = np.clip(q, 1e-10, None)
+            
+            # حساب تباعد KL
             kl_divergences.append(entropy(p, q))
         except Exception as e:
             logger.warning(f"⚠️ [Drift] Error calculating KL for {col}: {e}")
@@ -426,16 +447,8 @@ def detect_data_drift(X_ref: pd.DataFrame, X_current: pd.DataFrame) -> float:
 def save_ml_model_to_db(model_bundle: Dict[str, Any], model_name: str, metrics: Dict[str, Any]):
     logger.info(f"ℹ️ [DB Save] Saving model bundle '{model_name}'...")
     try:
-        # استخدام الطريقة الموصى بها لحفظ نموذج LightGBM
-        model_string = model_bundle['model'].model_to_string()
-        bundle_to_save = {
-            'model_string': model_string,
-            'scaler': model_bundle['scaler'],
-            'feature_names': model_bundle['feature_names'],
-            'last_trained': model_bundle['last_trained']
-        }
-        model_binary = pickle.dumps(bundle_to_save)
-        metrics_json = json.dumps(metrics, default=str) # Handle non-serializable types
+        model_binary = pickle.dumps(model_bundle)
+        metrics_json = json.dumps(metrics)
         with conn.cursor() as db_cur:
             db_cur.execute("""
                 INSERT INTO ml_models (model_name, model_data, trained_at, metrics) 
@@ -453,8 +466,37 @@ def send_telegram_message(text: str):
     try: requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
     except Exception as e: logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
 
+# ---------------------- نظام تنفيذ السكالب ----------------------
+def scalp_alert_system(prediction, probabilities):
+    """نظام تنبيهات ذكي للتداول السكالب"""
+    if probabilities[1] > 0.7:  # ثقة عالية في الصفقة
+        if prediction == 1:
+            return "إشارة شراء قوية"
+        elif prediction == -1:
+            return "إشارة بيع قوية"
+    elif probabilities[0] > 0.6:  # ثقة عالية في الحياد
+        return "الانتظار أفضل"
+    return "لا إشارة واضحة"
+
+def execute_scalp_trade(signal, symbol, price, model_name):
+    """تنفيذ صفقات السكالب التلقائية"""
+    tp_price = price * (1 + SCALP_TP)
+    sl_price = price * (1 - SCALP_SL)
+    
+    if signal == "إشارة شراء قوية":
+        # تنفيذ أمر شراء مع وقف الخسارة وجني الربح
+        msg = f"📈 [Trade] شراء {symbol} عند {price:.4f} | TP: {tp_price:.4f} | SL: {sl_price:.4f}"
+        logger.info(msg)
+        send_telegram_message(f"*{model_name}*\n{msg}")
+    elif signal == "إشارة بيع قوية":
+        # تنفيذ أمر بيع مع وقف الخسارة وجني الربح
+        msg = f"📉 [Trade] بيع {symbol} عند {price:.4f} | TP: {tp_price:.4f} | SL: {sl_price:.4f}"
+        logger.info(msg)
+        send_telegram_message(f"*{model_name}*\n{msg}")
+
+# ---------------------- الوظيفة الرئيسية ----------------------
 def run_training_job():
-    logger.info(f"🚀 Starting IMPROVED ML model training job ({BASE_ML_MODEL_NAME})...")
+    logger.info(f"🚀 Starting SCALPING ML model training job ({BASE_ML_MODEL_NAME})...")
     init_db()
     get_binance_client()
     fetch_and_cache_btc_data()
@@ -466,42 +508,58 @@ def run_training_job():
     send_telegram_message(f"🚀 *{BASE_ML_MODEL_NAME} Training Started*\nWill train models for {len(symbols_to_train)} symbols.")
     
     successful_models, failed_models = 0, 0
-    reference_data = {}
+    reference_models = {}  # لتخزين نماذج مرجعية لكشف الانجراح
     
     for symbol in symbols_to_train:
         logger.info(f"\n--- ⏳ [Main] Starting model training for {symbol} ---")
         try:
             df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, days=DATA_LOOKBACK_DAYS_FOR_TRAINING)
-            if df_hist is None or len(df_hist) < 200: # Ensure enough data
-                logger.warning(f"⚠️ [Main] Not enough data for {symbol}, skipping."); failed_models += 1; continue
+            if df_hist is None or df_hist.empty:
+                logger.warning(f"⚠️ [Main] No data for {symbol}, skipping."); failed_models += 1; continue
             
             prepared_data = prepare_data_for_ml(df_hist, btc_data_cache, symbol)
             if prepared_data is None:
                 failed_models += 1; continue
             X, y, feature_names = prepared_data
             
+            # كشف انجراح البيانات (إذا كان لدينا نموذج سابق)
             model_name = f"{BASE_ML_MODEL_NAME}_{symbol}"
-            if symbol in reference_data:
-                drift_score = detect_data_drift(reference_data[symbol], X)
+            if symbol in reference_models:
+                drift_score = detect_data_drift(reference_models[symbol], X)
                 logger.info(f"📈 [Drift] Data drift score for {symbol}: {drift_score:.4f}")
                 if drift_score > 0.25:
-                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f})")
+                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f}")
             
+            # تدريب النموذج
             training_result = train_enhanced_model(X, y)
             if not all(training_result):
                  failed_models += 1; continue
             final_model, final_scaler, model_metrics = training_result
             
-            if final_model and final_scaler and model_metrics.get('precision_1', 0) > 0.35 and model_metrics.get('precision_-1', 0) > 0.35:
+            # حفظ النموذج إذا كان أداءه جيداً
+            if final_model and final_scaler and model_metrics.get('precision_1', 0) > 0.35:
                 model_bundle = {
-                    'model': final_model, 'scaler': final_scaler, 
-                    'feature_names': feature_names, 'last_trained': datetime.utcnow().isoformat()
+                    'model': final_model, 
+                    'scaler': final_scaler, 
+                    'feature_names': feature_names,
+                    'last_trained': datetime.utcnow().isoformat()
                 }
                 save_ml_model_to_db(model_bundle, model_name, model_metrics)
                 successful_models += 1
-                reference_data[symbol] = X
+                reference_models[symbol] = X  # حفظ كمرجع لكشف الانجراح المستقبلي
+                
+                # اختبار النظام على آخر نقطة بيانات
+                last_point = X.iloc[[-1]]
+                scaled_data = final_scaler.transform(last_point)
+                prediction = final_model.predict(scaled_data)[0]
+                probabilities = final_model.predict_proba(scaled_data)[0]
+                
+                signal = scalp_alert_system(prediction, probabilities)
+                current_price = df_hist['close'].iloc[-1]
+                execute_scalp_trade(signal, symbol, current_price, model_name)
+                
             else:
-                logger.warning(f"⚠️ [Main] Model for {symbol} did not meet performance criteria. Discarding."); failed_models += 1
+                logger.warning(f"⚠️ [Main] Model for {symbol} is not useful. Discarding."); failed_models += 1
         except Exception as e:
             logger.critical(f"❌ [Main] A fatal error occurred for {symbol}: {e}", exc_info=True); failed_models += 1
         time.sleep(1)
@@ -513,27 +571,22 @@ def run_training_job():
     send_telegram_message(completion_message)
     logger.info(completion_message)
 
-    if conn: 
-        conn.close()
-        logger.info("🔌 [DB] تم إغلاق اتصال قاعدة البيانات")
+    if conn: conn.close()
+    logger.info("👋 [Main] ML training job finished.")
 
+# ---------------------- خادم الويب للصيانة ----------------------
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
     """Endpoint for Render health checks."""
-    return "ML Trainer service is running and healthy.", 200
+    return "ML Scalper service is running and healthy.", 200
 
 if __name__ == "__main__":
     training_thread = Thread(target=run_training_job)
     training_thread.daemon = True
     training_thread.start()
     
-    # تم التعليق على السطر التالي للسماح لخادم فلاسك بالعمل فوراً
-    # بينما تتم عملية التدريب في الخلفية. هذا ضروري لخدمات مثل Render.
-    # training_thread.join()
-    
     port = int(os.environ.get("PORT", 10001))
     logger.info(f"🌍 Starting web server on port {port} to keep the service alive...")
     app.run(host='0.0.0.0', port=port)
-
