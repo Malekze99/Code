@@ -14,12 +14,14 @@ from binance.client import Client
 from datetime import datetime, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Tuple
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from sklearn.metrics import classification_report, accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from flask import Flask
 from threading import Thread
+from scipy.stats import entropy
+from imblearn.over_sampling import ADASYN
 
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
@@ -130,7 +132,8 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
         if not klines: return None
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in numeric_cols: df[col] = pd.to_numeric(df[col], errors='coerce')
+        for col in numeric_cols: 
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         return df[numeric_cols].dropna()
@@ -148,49 +151,90 @@ def fetch_and_cache_btc_data():
 # --- دوال حساب المؤشرات الفنية المتقدمة ---
 def calculate_adx(high, low, close, window=14):
     """حساب مؤشر ADX يدوياً"""
-    up = high.diff()
-    down = -low.diff()
-    
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    
-    tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift()), np.abs(low - close.shift())))
-    
-    atr = tr.rolling(window).mean()
-    plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
-    
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.rolling(window).mean()
-    return adx, plus_di, minus_di
+    try:
+        # تحويل المدخلات إلى سلسلة Pandas
+        high = pd.Series(high)
+        low = pd.Series(low)
+        close = pd.Series(close)
+        
+        up = high.diff()
+        down = -low.diff()
+        
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+        
+        # تحويل النتائج إلى سلسلة Pandas
+        plus_dm = pd.Series(plus_dm, index=high.index)
+        minus_dm = pd.Series(minus_dm, index=high.index)
+        
+        tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift()), np.abs(low - close.shift())))
+        tr = pd.Series(tr, index=high.index)  # تحويل إلى سلسلة
+        
+        atr = tr.rolling(window).mean()
+        plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
+        
+        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window).mean()
+        return adx, plus_di, minus_di
+    except Exception as e:
+        logger.error(f"❌ [ADX] خطأ في حساب ADX: {e}")
+        return pd.Series(), pd.Series(), pd.Series()
 
 def calculate_mfi(high, low, close, volume, window=14):
     """حساب مؤشر MFI يدوياً"""
-    typical_price = (high + low + close) / 3
-    money_flow = typical_price * volume
-    
-    positive_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
-    negative_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
-    
-    pos_flow_sum = positive_flow.rolling(window).sum()
-    neg_flow_sum = negative_flow.rolling(window).sum()
-    
-    # حساب مؤشر MFI بشكل صحيح
-    money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
-    mfi = 100 - (100 / (1 + money_ratio))
-    return mfi
+    try:
+        # تحويل المدخلات إلى سلسلة Pandas
+        high = pd.Series(high)
+        low = pd.Series(low)
+        close = pd.Series(close)
+        volume = pd.Series(volume)
+        
+        typical_price = (high + low + close) / 3
+        money_flow = typical_price * volume
+        
+        positive_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
+        negative_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
+        
+        # تحويل النتائج إلى سلسلة Pandas
+        positive_flow = pd.Series(positive_flow, index=high.index)
+        negative_flow = pd.Series(negative_flow, index=high.index)
+        
+        pos_flow_sum = positive_flow.rolling(window).sum()
+        neg_flow_sum = negative_flow.rolling(window).sum()
+        
+        money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
+        mfi = 100 - (100 / (1 + money_ratio))
+        return mfi
+    except Exception as e:
+        logger.error(f"❌ [MFI] خطأ في حساب MFI: {e}")
+        return pd.Series()
 
 def calculate_cci(high, low, close, window=20):
     """حساب مؤشر CCI يدوياً"""
-    tp = (high + low + close) / 3
-    sma = tp.rolling(window).mean()
-    mad = tp.rolling(window).apply(lambda x: np.abs(x - x.mean()).mean())
-    cci = (tp - sma) / (0.015 * (mad + 1e-9))
-    return cci
+    try:
+        # تحويل المدخلات إلى سلسلة Pandas
+        high = pd.Series(high)
+        low = pd.Series(low)
+        close = pd.Series(close)
+        
+        tp = (high + low + close) / 3
+        sma = tp.rolling(window).mean()
+        mad = tp.rolling(window).apply(lambda x: np.abs(x - x.mean()).mean())
+        cci = (tp - sma) / (0.015 * (mad + 1e-9))
+        return cci
+    except Exception as e:
+        logger.error(f"❌ [CCI] خطأ في حساب CCI: {e}")
+        return pd.Series()
 
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
-    df_calc = df.copy()
-
+    # نسخ العمق لتجنب تحذير السلسلة
+    df_calc = df.copy(deep=True)
+    
+    # تحويل الأعمدة إلى نوع float
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df_calc[col] = df_calc[col].astype(float)
+    
     # ATR
     high_low = df_calc['high'] - df_calc['low']
     high_close = (df_calc['high'] - df_calc['close'].shift()).abs()
@@ -249,6 +293,9 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc['btc_correlation'] = merged_df['returns'].rolling(window=BTC_CORR_PERIOD).corr(merged_df['btc_returns'])
     df_calc['hour_of_day'] = df_calc.index.hour
     
+    # التقلب التاريخي (تم نقله لأعلى)
+    df_calc['volatility'] = df_calc['close'].pct_change().rolling(14).std()
+    
     # إضافة المؤشرات المتقدمة
     df_calc['adx'], df_calc['adx_pos'], df_calc['adx_neg'] = calculate_adx(
         df_calc['high'], df_calc['low'], df_calc['close']
@@ -271,15 +318,18 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc['rsi_macd_interaction'] = df_calc['rsi'] * df_calc['macd_hist']
     df_calc['atr_volume_interaction'] = df_calc['atr'] * df_calc['relative_volume']
     
-    # التقلب التاريخي
-    df_calc['volatility'] = df_calc['close'].pct_change().rolling(14).std()
-    
     return df_calc
 
 def get_enhanced_labels(prices: pd.Series, atr: pd.Series, volatility: pd.Series) -> pd.Series:
     """وضع علامات متقدمة باستخدام تقنية Triple-Barrier المعززة"""
+    # تحويل المدخلات إلى سلسلة Pandas
+    prices = pd.Series(prices)
+    atr = pd.Series(atr)
+    volatility = pd.Series(volatility)
+    
     labels = pd.Series(0, index=prices.index)
     volatility_factor = 1 + (volatility.rolling(14).std() * 0.5)  # عامل التقلب الديناميكي
+    volatility_factor = volatility_factor.fillna(1)  # تعبئة القيم الناقصة
     
     for i in tqdm(range(len(prices) - MAX_HOLD_PERIOD), desc="Enhanced Labeling", leave=False):
         entry_price = prices.iloc[i]
@@ -340,7 +390,6 @@ def remove_outliers(df, columns, threshold=3):
 
 def balance_classes(X, y):
     """موازنة الفئات باستخدام تقنية ADASYN المتقدمة"""
-    from imblearn.over_sampling import ADASYN
     ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
     return ada.fit_resample(X, y)
 
@@ -386,7 +435,7 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
     logger.info("ℹ️ [ML Train] Starting advanced model training...")
     
     # موازنة الفئات
-    X_bal, y_bal = balance_classes(X, y)
+    X_bal, y_bal = balance_classes(X.values, y.values)
     
     # تقسيم البيانات مع التحقق من التسرب الزمني
     tscv = TimeSeriesSplit(n_splits=5)
@@ -407,8 +456,8 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
     best_score = -np.inf
     
     for fold, (train_index, val_index) in enumerate(tscv.split(X_bal)):
-        X_train, X_val = X_bal.iloc[train_index], X_bal.iloc[val_index]
-        y_train, y_val = y_bal.iloc[train_index], y_bal.iloc[val_index]
+        X_train, X_val = X_bal[train_index], X_bal[val_index]
+        y_train, y_val = y_bal[train_index], y_bal[val_index]
         
         # المعايرة
         scaler = StandardScaler().fit(X_train)
@@ -584,8 +633,9 @@ def run_training_job():
     send_telegram_message(completion_message)
     logger.info(completion_message)
 
-    if conn: conn.close()
-    logger.info("👋 [Main] ML training job finished.")
+    if conn: 
+        conn.close()
+        logger.info("🔌 [DB] تم إغلاق اتصال قاعدة البيانات")
 
 app = Flask(__name__)
 
@@ -598,6 +648,9 @@ if __name__ == "__main__":
     training_thread = Thread(target=run_training_job)
     training_thread.daemon = True
     training_thread.start()
+    
+    # انتظار انتهاء الخيط الفرعي
+    training_thread.join()
     
     port = int(os.environ.get("PORT", 10001))
     logger.info(f"🌍 Starting web server on port {port} to keep the service alive...")
