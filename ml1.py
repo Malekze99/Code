@@ -21,18 +21,17 @@ from tqdm import tqdm
 from flask import Flask
 from threading import Thread
 from scipy.stats import entropy
-from imblearn.over_sampling import ADASYN
 
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('ml_scalp_trainer_v6.log', encoding='utf-8'),
+        logging.FileHandler('ml_scalp_trainer_v7.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('MLScalpTrainer_V6')
+logger = logging.getLogger('MLScalpTrainer_V7')
 
 # ---------------------- تحميل متغيرات البيئة ----------------------
 try:
@@ -46,8 +45,8 @@ except Exception as e:
      exit(1)
 
 # ---------------------- إعداد ثوابت السكالب ----------------------
-BASE_ML_MODEL_NAME: str = 'LightGBM_Scalper_V6'
-SIGNAL_GENERATION_TIMEFRAME: str = '5m'  # تغيير إلى 5 دقائق للتداول السكالب
+BASE_ML_MODEL_NAME: str = 'LightGBM_Scalper_V7'
+SIGNAL_GENERATION_TIMEFRAME: str = '5m'
 DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 90
 BTC_SYMBOL = 'BTCUSDT'
 
@@ -208,7 +207,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     delta = df_calc['close'].diff()
     gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9)))))
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9))))
 
     # MACD سريع
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
@@ -295,11 +294,6 @@ def remove_outliers(df, columns, threshold=3):
         df = df[np.abs(z_score) < threshold]
     return df
 
-def balance_classes(X, y):
-    """موازنة الفئات باستخدام تقنية ADASYN المتقدمة"""
-    ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
-    return ada.fit_resample(X, y)
-
 def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Series, List[str]]]:
     logger.info(f"ℹ️ [ML Prep] Preparing data for {symbol}...")
     df_featured = calculate_features(df, btc_df)
@@ -342,9 +336,6 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
     """تدريب متقدم للسكالب باستخدام البحث العشوائي"""
     logger.info("ℹ️ [ML Train] Starting advanced scalping model training...")
     
-    # موازنة الفئات
-    X_bal, y_bal = balance_classes(X, y)
-    
     # تقسيم البيانات مع التحقق من التسرب الزمني
     tscv = TimeSeriesSplit(n_splits=5)
     
@@ -358,16 +349,17 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
         'reg_alpha': [0, 0.1],
         'reg_lambda': [0, 0.1],
         'min_child_samples': [10, 20],
-        'num_leaves': [31, 63]
+        'num_leaves': [31, 63],
+        'class_weight': ['balanced', None]
     }
     
     best_model = None
     best_scaler = None
     best_score = -np.inf
     
-    for fold, (train_index, val_index) in enumerate(tscv.split(X_bal)):
-        X_train, X_val = X_bal.iloc[train_index], X_bal.iloc[val_index]
-        y_train, y_val = y_bal.iloc[train_index], y_bal.iloc[val_index]
+    for fold, (train_index, val_index) in enumerate(tscv.split(X)):
+        X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+        y_train, y_val = y.iloc[train_index], y.iloc[val_index]
         
         # المعايرة
         scaler = StandardScaler().fit(X_train)
@@ -397,21 +389,21 @@ def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], 
         return None, None, None
     
     # تدريب النموذج النهائي على كامل البيانات
-    X_full_scaled = best_scaler.transform(X_bal)
-    best_model.fit(X_full_scaled, y_bal)
+    X_full_scaled = best_scaler.transform(X)
+    best_model.fit(X_full_scaled, y)
     
     # حساب المقاييس النهائية
     y_pred = best_model.predict(X_full_scaled)
-    final_report = classification_report(y_bal, y_pred, output_dict=True, zero_division=0)
+    final_report = classification_report(y, y_pred, output_dict=True, zero_division=0)
     
     avg_metrics = {
-        'accuracy': accuracy_score(y_bal, y_pred),
-        'f1_weighted': f1_score(y_bal, y_pred, average='weighted'),
-        'precision_1': precision_score(y_bal, y_pred, labels=[1], average='binary'),
-        'recall_1': recall_score(y_bal, y_pred, labels=[1], average='binary'),
-        'precision_-1': precision_score(y_bal, y_pred, labels=[-1], average='binary'),
-        'recall_-1': recall_score(y_bal, y_pred, labels=[-1], average='binary'),
-        'num_samples_trained': len(X_bal),
+        'accuracy': accuracy_score(y, y_pred),
+        'f1_weighted': f1_score(y, y_pred, average='weighted'),
+        'precision_1': precision_score(y, y_pred, labels=[1], average='binary'),
+        'recall_1': recall_score(y, y_pred, labels=[1], average='binary'),
+        'precision_-1': precision_score(y, y_pred, labels=[-1], average='binary'),
+        'recall_-1': recall_score(y, y_pred, labels=[-1], average='binary'),
+        'num_samples_trained': len(X),
         'best_params': random_search.best_params_
     }
     
