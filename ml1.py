@@ -24,7 +24,7 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.preprocessing import StandardScaler
-from lightgbm import early_stopping
+from lightgbm import early_stopping, log_evaluation
 # ---------------------- Logging Setup ----------------------
 logging.basicConfig(
     level=logging.INFO,
