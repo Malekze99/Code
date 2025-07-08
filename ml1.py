@@ -725,7 +725,7 @@ def train_and_evaluate_model(data: pd.DataFrame) -> Tuple[Any, Dict[str, Any]]:
         sample_weight=sample_weights,
         eval_set=[(X_test_scaled_df, y_test)],
         eval_metric='binary_logloss',
-        callbacks=[early_stopping(stopping_rounds=50)],
+        early_stopping=50,
         verbose=10
     )
     
