@@ -716,7 +716,8 @@ def train_and_evaluate_model(data: pd.DataFrame) -> Tuple[Any, Dict[str, Any]]:
         max_depth=-1,
         random_state=42,
         n_jobs=-1,
-        class_weight='balanced'  # Handle class imbalance
+        class_weight='balanced' # Handle class imbalance
+        verbosity=-1
     )
     
     model.fit(
@@ -725,8 +726,10 @@ def train_and_evaluate_model(data: pd.DataFrame) -> Tuple[Any, Dict[str, Any]]:
         sample_weight=sample_weights,
         eval_set=[(X_test_scaled_df, y_test)],
         eval_metric='binary_logloss',
-        callbacks=[early_stopping(stopping_rounds=50)],
-        verbose=10
+        callbacks=[
+        early_stopping(stopping_rounds=50),
+        log_evaluation(period=10)  # بديل لـ verbose
+        ]
     )
     
     logger.info("✅ [ML Train] LightGBM model trained successfully with SMC features.")
