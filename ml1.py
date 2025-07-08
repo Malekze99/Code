@@ -24,7 +24,7 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.preprocessing import StandardScaler
-
+from lightgbm import early_stopping
 # ---------------------- Logging Setup ----------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -725,7 +725,7 @@ def train_and_evaluate_model(data: pd.DataFrame) -> Tuple[Any, Dict[str, Any]]:
         sample_weight=sample_weights,
         eval_set=[(X_test_scaled_df, y_test)],
         eval_metric='binary_logloss',
-        early_stopping_rounds=20,
+        callbacks=[early_stopping(stopping_rounds=50)],
         verbose=10
     )
     
