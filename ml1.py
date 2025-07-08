@@ -716,7 +716,7 @@ def train_and_evaluate_model(data: pd.DataFrame) -> Tuple[Any, Dict[str, Any]]:
         max_depth=-1,
         random_state=42,
         n_jobs=-1,
-        class_weight='balanced' # Handle class imbalance
+        class_weight='balanced', # Handle class imbalance
         verbosity=-1
     )
     
