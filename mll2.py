@@ -4,7 +4,7 @@ import json
 import logging
 import requests
 import numpy as np
-import pandas as pd
+#import pandas as pd
 import psycopg2
 import pickle
 from psycopg2 import sql, OperationalError, InterfaceError
@@ -14,6 +14,7 @@ from binance.exceptions import BinanceAPIException, BinanceRequestException
 from datetime import datetime, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Tuple, Union
+import pandas_ta as pt
 
 # Flask and threading libraries
 from flask import Flask, request, Response
