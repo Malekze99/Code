@@ -27,7 +27,39 @@ from sklearn.preprocessing import StandardScaler
 from lightgbm import early_stopping, log_evaluation
 
 # New imports for advanced features and optimization
-import ta # Technical Analysis library
+
+#import ta # Technical Analysis library
+import ta
+import inspect # لإلقاء نظرة داخل الكائنات
+import sys
+
+print(f"DEBUG: ta module path: {ta.__file__}")
+print(f"DEBUG: sys.path: {sys.path}")
+print(f"DEBUG: ta version: {ta.__version__}")
+
+# التحقق مما إذا كانت true_range موجودة في ta.volatility
+if hasattr(ta.volatility, 'true_range'):
+    print("DEBUG: 'true_range' function IS found in ta.volatility.")
+else:
+    print("DEBUG: 'true_range' function IS NOT found in ta.volatility.")
+    # إذا لم يتم العثور عليها، اطبع محتويات ta.volatility
+    print("DEBUG: Contents of ta.volatility module:")
+    for name, obj in inspect.getmembers(ta.volatility):
+        if not name.startswith('_'): # تجاهل السمات الداخلية
+            print(f"  - {name}")
+
+# حاول استيرادها مباشرة
+try:
+    from ta.volatility import true_range
+    print("DEBUG: Successfully imported true_range directly.")
+except ImportError as e:
+    print(f"DEBUG: Failed to import true_range directly: {e}")
+
+# (استمر الكود الخاص بك هنا...)
+
+
+##########
+
 from imblearn.over_sampling import SMOTE # For handling class imbalance
 import optuna # For hyperparameter optimization
 
