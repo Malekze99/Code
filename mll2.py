@@ -30,7 +30,7 @@ from lightgbm import early_stopping, log_evaluation
 # New imports for advanced features and optimization
 
 #import ta # Technical Analysis library
-import ta
+#import ta
 import inspect # لإلقاء نظرة داخل الكائنات
 import sys
 
