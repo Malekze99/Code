@@ -718,7 +718,7 @@ def prepare_data_for_ml(df: pd.DataFrame, symbol: str, target_period: int = 5, b
 
 
     # --- Volatility & Momentum Features ---
-    df_calc['true_range'] = ta.volatility.true_range(high=df_calc['high'], low=df_calc['low'], close=df_calc['close'])
+    df_calc['true_range'] = pt.true_range(high=df_calc['high'], low=df_calc['low'], close=df_calc['close'])
     df_calc['atr'] = ta.volatility.average_true_range(high=df_calc['high'], low=df_calc['low'], close=df_calc['close'], window=14)
     df_calc['atr_20'] = ta.volatility.average_true_range(high=df_calc['high'], low=df_calc['low'], close=df_calc['close'], window=20)
     df_calc['price_change_ratio'] = (df_calc['close'] - df_calc['open']) / df_calc['open']
