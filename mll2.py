@@ -28,7 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from lightgbm import early_stopping, log_evaluation
 
 # New imports for advanced features and optimization
-
+import ta
 
 ##########
 
