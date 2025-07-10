@@ -4,7 +4,7 @@ import json
 import logging
 import requests
 import numpy as np
-#import pandas as pd
+import pandas as pd
 import psycopg2
 import pickle
 from psycopg2 import sql, OperationalError, InterfaceError
