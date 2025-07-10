@@ -35,7 +35,7 @@ import sys
 
 print(f"DEBUG: ta module path: {ta.__file__}")
 print(f"DEBUG: sys.path: {sys.path}")
-print(f"DEBUG: ta version: {ta.__version__}")
+#print(f"DEBUG: ta version: {ta.__version__}")
 
 # التحقق مما إذا كانت true_range موجودة في ta.volatility
 if hasattr(ta.volatility, 'true_range'):
