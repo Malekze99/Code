@@ -456,6 +456,13 @@ def calculate_adx(df: pd.DataFrame, lookback: int = ADX_LOOKBACK) -> pd.DataFram
     """Calculate ADX (Average Directional Index) to determine trend strength."""
     df = df.copy()
     
+    # First calculate ATR (Average True Range) which is needed for ADX calculation
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = true_range.rolling(window=lookback).mean()
+    
     # حساب +DI و -DI
     df['up_move'] = df['high'].diff()
     df['down_move'] = -df['low'].diff()
