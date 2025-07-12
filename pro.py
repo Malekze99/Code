@@ -1,4 +1,4 @@
-# enhanced_mll_complete.py - الإصدار الكامل مع جميع التحسينات
+# enhanced_mll_complete_fixed.py
 import time
 import os
 import json
@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, Response
 from threading import Thread, Lock
 from queue import Queue
+import copy
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -61,14 +62,14 @@ logger = logging.getLogger('EnhancedMLTrading')
 # ---------------------- Configuration ----------------------
 class Config:
     # Data Parameters
-    DATA_LOOKBACK_DAYS = 180  # Increased from 90 days
+    DATA_LOOKBACK_DAYS = 180
     SIGNAL_TIMEFRAME = '5m'
     SYMBOLS_FILE = 'crypto_list.txt'
-    MAX_SYMBOLS = 50  # Limit for testing
+    MAX_SYMBOLS = 50
     
     # Target Parameters
-    TARGET_PERIODS = 5  # Number of future periods to predict
-    TARGET_CHANGE_THRESHOLD = 0.01  # 1% price movement threshold
+    TARGET_PERIODS = 5
+    TARGET_CHANGE_THRESHOLD = 0.01
     
     # Feature Engineering
     VOLUME_LOOKBACK = 5
@@ -80,16 +81,13 @@ class Config:
     BB_WINDOW = 20
     VWAP_WINDOW = 15
     ATR_WINDOW = 14
-    ICHIMOKU_CONVERSION = 9
-    ICHIMOKU_BASE = 26
-    ICHIMOKU_LAG = 52
     
     # Model Training
     TRAIN_TEST_SPLIT = 0.2
     RANDOM_STATE = 42
     EARLY_STOPPING_ROUNDS = 50
     CV_FOLDS = 5
-    N_JOBS = -1  # Use all available cores
+    N_JOBS = -1
     
     # SMC Parameters
     LIQUIDITY_WINDOW = 20
@@ -98,15 +96,15 @@ class Config:
     FVG_STRENGTH_THRESHOLD = 0.003
     
     # Risk Management
-    MAX_POSITION_SIZE = 0.1  # 10% of portfolio per trade
-    STOP_LOSS_PCT = 0.02  # 2% stop loss
-    TAKE_PROFIT_PCT = 0.03  # 3% take profit
+    MAX_POSITION_SIZE = 0.1
+    STOP_LOSS_PCT = 0.02
+    TAKE_PROFIT_PCT = 0.03
     
     # API Configuration
     FLASK_PORT = 10000
     TELEGRAM_TIMEOUT = 30
     BINANCE_RETRIES = 3
-    BINANCE_RATE_LIMIT_DELAY = 1  # seconds
+    BINANCE_RATE_LIMIT_DELAY = 1
 
 # ---------------------- Database & API Setup ----------------------
 class DatabaseManager:
@@ -150,8 +148,7 @@ class DatabaseManager:
     
     def _create_tables(self):
         tables = [
-            """
-            CREATE TABLE IF NOT EXISTS enhanced_signals (
+            """CREATE TABLE IF NOT EXISTS enhanced_signals (
                 id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 timestamp TIMESTAMP NOT NULL,
@@ -167,10 +164,8 @@ class DatabaseManager:
                 profit_loss FLOAT,
                 closed_at TIMESTAMP,
                 UNIQUE(symbol, timestamp)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS enhanced_models (
+            )""",
+            """CREATE TABLE IF NOT EXISTS enhanced_models (
                 id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 model_name TEXT NOT NULL,
@@ -180,10 +175,8 @@ class DatabaseManager:
                 feature_importance JSONB,
                 trained_at TIMESTAMP DEFAULT NOW(),
                 UNIQUE(symbol, model_name)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS training_metadata (
+            )""",
+            """CREATE TABLE IF NOT EXISTS training_metadata (
                 id SERIAL PRIMARY KEY,
                 training_date TIMESTAMP DEFAULT NOW(),
                 symbols TEXT[] NOT NULL,
@@ -191,10 +184,8 @@ class DatabaseManager:
                 avg_metrics JSONB NOT NULL,
                 duration_seconds FLOAT NOT NULL,
                 parameters JSONB NOT NULL
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS market_conditions (
+            )""",
+            """CREATE TABLE IF NOT EXISTS market_conditions (
                 id SERIAL PRIMARY KEY,
                 timestamp TIMESTAMP DEFAULT NOW(),
                 btc_dominance FLOAT,
@@ -202,8 +193,7 @@ class DatabaseManager:
                 fear_greed_index FLOAT,
                 volume_24h FLOAT,
                 trending_coins JSONB
-            )
-            """
+            )"""
         ]
         
         try:
@@ -251,6 +241,17 @@ class BinanceDataFetcher:
             time.sleep(Config.BINANCE_RATE_LIMIT_DELAY - elapsed)
         self.last_request_time = time.time()
     
+    def validate_symbol(self, symbol: str) -> bool:
+        """Check if symbol is valid on Binance"""
+        try:
+            self._rate_limit()
+            self.client.get_symbol_info(symbol)
+            return True
+        except BinanceAPIException as e:
+            if e.code == -1121:  # Invalid symbol
+                return False
+            raise
+    
     def fetch_klines(self, symbol: str, interval: str, start_str: str, end_str: str = None):
         self._rate_limit()
         for attempt in range(Config.BINANCE_RETRIES):
@@ -271,6 +272,10 @@ class BinanceDataFetcher:
         return None
     
     def fetch_enhanced_data(self, symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
+        if not self.validate_symbol(symbol):
+            logger.warning(f"⚠️ Invalid symbol: {symbol}")
+            return None
+            
         start_date = datetime.utcnow() - timedelta(days=days)
         start_str = start_date.strftime("%d %b %Y %H:%M:%S")
         
@@ -284,12 +289,10 @@ class BinanceDataFetcher:
             'taker_buy_quote', 'ignore'
         ])
         
-        # Convert types
         numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume']
         df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # Clean and prepare
         df = df.set_index('timestamp')[numeric_cols]
         df = df[~df.index.duplicated(keep='first')]
         df = df.sort_index()
@@ -297,7 +300,7 @@ class BinanceDataFetcher:
         
         return df
 
-# ---------------------- Advanced Feature Engineering ----------------------
+# ---------------------- Feature Engineering ----------------------
 class FeatureEngineer:
     @staticmethod
     def add_smc_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -348,11 +351,8 @@ class FeatureEngineer:
             current_high = df.iloc[i]['high']
             current_low = df.iloc[i]['low']
             
-            # Bullish FVG (current low > previous high)
             if (current_low - prev_high) > (prev_high * Config.FVG_STRENGTH_THRESHOLD):
                 df.loc[df.index[i], 'bullish_fvg'] = 1
-            
-            # Bearish FVG (current high < previous low)
             elif (prev_low - current_high) > (prev_low * Config.FVG_STRENGTH_THRESHOLD):
                 df.loc[df.index[i], 'bearish_fvg'] = 1
         
@@ -372,22 +372,15 @@ class FeatureEngineer:
                 prev_swing_high = df.iloc[i-Config.SWING_WINDOW]['swing_high']
                 prev_swing_low = df.iloc[i-Config.SWING_WINDOW]['swing_low']
                 
-                # Bullish BOS
                 if current_high > prev_swing_high:
                     df.loc[df.index[i], 'bullish_bos'] = 1
-                
-                # Bearish BOS
                 if current_low < prev_swing_low:
                     df.loc[df.index[i], 'bearish_bos'] = 1
-                
-                # Bullish CHOCH
                 if (df.iloc[i]['close'] > df.iloc[i]['open'] and
                     current_low > prev_swing_low and
                     df.iloc[i-1]['close'] < df.iloc[i-1]['open'] and
                     df.iloc[i-1]['low'] < prev_swing_low):
                     df.loc[df.index[i], 'bullish_choch'] = 1
-                
-                # Bearish CHOCH
                 if (df.iloc[i]['close'] < df.iloc[i]['open'] and
                     current_high < prev_swing_high and
                     df.iloc[i-1]['close'] > df.iloc[i-1]['open'] and
@@ -441,9 +434,7 @@ class FeatureEngineer:
         
         ichimoku = IchimokuIndicator(
             df['high'], df['low'],
-            Config.ICHIMOKU_CONVERSION,
-            Config.ICHIMOKU_BASE,
-            Config.ICHIMOKU_LAG
+            9, 26, 52  # Using standard Ichimoku settings
         )
         df['ichimoku_conv'] = ichimoku.ichimoku_conversion_line()
         df['ichimoku_base'] = ichimoku.ichimoku_base_line()
@@ -906,24 +897,33 @@ class TradingModelPipeline:
         self.symbols = []
 
     def load_symbols(self) -> List[str]:
-        """Load symbols from configuration file"""
+        """Load and validate symbols from configuration file"""
         try:
             with open(Config.SYMBOLS_FILE, 'r') as f:
-                symbols = [line.strip().upper() for line in f 
-                          if line.strip() and not line.startswith('#')]
-                symbols = list(set(symbols))[:Config.MAX_SYMBOLS]
-                self.symbols = symbols
-                return symbols
+                raw_symbols = [line.strip().upper() for line in f 
+                             if line.strip() and not line.startswith('#')]
+                
+            # Validate symbols with Binance
+            valid_symbols = []
+            for symbol in raw_symbols[:Config.MAX_SYMBOLS]:
+                if self.data_fetcher.validate_symbol(symbol):
+                    valid_symbols.append(symbol)
+                else:
+                    logger.warning(f"Removing invalid symbol: {symbol}")
+            
+            self.symbols = valid_symbols
+            return valid_symbols
+            
         except Exception as e:
             logger.error(f"Failed to load symbols: {e}")
             return []
 
     def prepare_data(self, symbol: str, btc_data: pd.DataFrame = None) -> Optional[Tuple[pd.DataFrame, pd.Series]]:
-        """Prepare data for a single symbol"""
+        """Prepare data for a single symbol with enhanced error handling"""
         try:
             logger.info(f"📊 Preparing data for {symbol}")
             
-            # 1. Fetch data
+            # 1. Fetch data with retries
             df = self.data_fetcher.fetch_enhanced_data(symbol, Config.SIGNAL_TIMEFRAME, Config.DATA_LOOKBACK_DAYS)
             if df is None or len(df) < 100:
                 logger.warning(f"Insufficient data for {symbol}")
@@ -957,7 +957,7 @@ class TradingModelPipeline:
             return None
 
     def train_symbol_model(self, symbol: str, btc_data: pd.DataFrame = None) -> Optional[Dict[str, Any]]:
-        """Complete training pipeline for a single symbol"""
+        """Complete training pipeline for a single symbol with enhanced robustness"""
         try:
             logger.info(f"🚀 Starting training for {symbol}")
             self.training_status = f"Training {symbol}"
@@ -983,62 +983,88 @@ class TradingModelPipeline:
                 X_train_res, X_test, scaler_type='robust'
             )
             
-            # 5. Train models
-            models = {
-                'lightgbm': self.model_trainer.train_lightgbm(X_train_scaled, y_train_res),
-                'xgboost': self.model_trainer.train_xgboost(X_train_scaled, y_train_res),
-                'random_forest': self.model_trainer.train_random_forest(X_train_scaled, y_train_res)
-            }
+            # 5. Train models with error handling
+            models = {}
+            try:
+                models['lightgbm'] = self.model_trainer.train_lightgbm(X_train_scaled, y_train_res)
+            except Exception as e:
+                logger.error(f"Failed to train LightGBM for {symbol}: {e}")
+            
+            try:
+                models['xgboost'] = self.model_trainer.train_xgboost(X_train_scaled, y_train_res)
+            except Exception as e:
+                logger.error(f"Failed to train XGBoost for {symbol}: {e}")
+            
+            try:
+                models['random_forest'] = self.model_trainer.train_random_forest(X_train_scaled, y_train_res)
+            except Exception as e:
+                logger.error(f"Failed to train Random Forest for {symbol}: {e}")
+            
+            if not models:
+                logger.error(f"No models trained successfully for {symbol}")
+                return None
             
             # 6. Create and evaluate ensemble
-            ensemble = self.model_trainer.create_ensemble(models)
-            ensemble.fit(X_train_scaled, y_train_res)
-            models['ensemble'] = ensemble
+            try:
+                ensemble = self.model_trainer.create_ensemble(models)
+                ensemble.fit(X_train_scaled, y_train_res)
+                models['ensemble'] = ensemble
+            except Exception as e:
+                logger.error(f"Failed to create ensemble for {symbol}: {e}")
+                models['ensemble'] = next(iter(models.values()))  # Use first available model
             
             # 7. Evaluate all models
             results = {}
             for name, model in models.items():
-                metrics = self.model_evaluator.evaluate_model(model, X_test_scaled, y_test)
-                feature_importance = self.model_evaluator.calculate_feature_importance(
-                    model, features.columns
-                )
-                
-                results[name] = {
-                    'model': model,
-                    'metrics': metrics,
-                    'feature_importance': feature_importance
-                }
-                
-                # Save model to database
-                self.db.execute_query(
-                    """
-                    INSERT INTO enhanced_models 
-                    (symbol, model_name, model_type, model_data, metrics, feature_importance)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (symbol, model_name) 
-                    DO UPDATE SET 
-                        model_data = EXCLUDED.model_data,
-                        metrics = EXCLUDED.metrics,
-                        feature_importance = EXCLUDED.feature_importance,
-                        trained_at = NOW()
-                    """,
-                    (
-                        symbol,
-                        f"enhanced_{name}",
-                        type(model).__name__,
-                        pickle.dumps(model),
-                        json.dumps(metrics),
-                        json.dumps(feature_importance)
+                try:
+                    metrics = self.model_evaluator.evaluate_model(model, X_test_scaled, y_test)
+                    feature_importance = self.model_evaluator.calculate_feature_importance(
+                        model, features.columns
                     )
-                )
+                    
+                    results[name] = {
+                        'model': model,
+                        'metrics': metrics,
+                        'feature_importance': feature_importance
+                    }
+                    
+                    # Save model to database
+                    config_dict = {k: v for k, v in vars(Config).items() if not k.startswith('__')}
+                    self.db.execute_query(
+                        """
+                        INSERT INTO enhanced_models 
+                        (symbol, model_name, model_type, model_data, metrics, feature_importance)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (symbol, model_name) 
+                        DO UPDATE SET 
+                            model_data = EXCLUDED.model_data,
+                            metrics = EXCLUDED.metrics,
+                            feature_importance = EXCLUDED.feature_importance,
+                            trained_at = NOW()
+                        """,
+                        (
+                            symbol,
+                            f"enhanced_{name}",
+                            type(model).__name__,
+                            pickle.dumps(model),
+                            json.dumps(metrics),
+                            json.dumps(feature_importance)
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to evaluate/save model {name} for {symbol}: {e}")
             
             # 8. SHAP analysis for best model
-            best_model_name = max(results.keys(), 
-                                key=lambda k: results[k]['metrics']['f1'])
-            shap_analysis = self.model_evaluator.analyze_shap_values(
-                results[best_model_name]['model'], X_test_scaled
-            )
-            results['shap_analysis'] = shap_analysis
+            if results:
+                best_model_name = max(results.keys(), 
+                                    key=lambda k: results[k]['metrics']['f1'])
+                try:
+                    shap_analysis = self.model_evaluator.analyze_shap_values(
+                        results[best_model_name]['model'], X_test_scaled
+                    )
+                    results['shap_analysis'] = shap_analysis
+                except Exception as e:
+                    logger.error(f"SHAP analysis failed for {symbol}: {e}")
             
             logger.info(f"✅ Completed training for {symbol}")
             return results
@@ -1050,24 +1076,26 @@ class TradingModelPipeline:
             self.training_status = "Idle"
 
     def run_pipeline(self):
-        """Run complete training pipeline for all symbols"""
+        """Run complete training pipeline with comprehensive error handling"""
         start_time = time.time()
         self.training_status = "Running"
         self.last_training_time = datetime.now()
         overall_results = {}
         
         try:
-            # 1. Load symbols
+            # 1. Load and validate symbols
             symbols = self.load_symbols()
             if not symbols:
                 raise ValueError("No valid symbols found")
+            
+            logger.info(f"Starting training for {len(symbols)} valid symbols: {symbols}")
             
             # 2. Pre-fetch BTC data for market context
             btc_data = self.data_fetcher.fetch_enhanced_data(
                 "BTCUSDT", Config.SIGNAL_TIMEFRAME, Config.DATA_LOOKBACK_DAYS
             )
             
-            # 3. Train models in parallel
+            # 3. Train models in parallel with error handling
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
                     executor.submit(self.train_symbol_model, symbol, btc_data): symbol
@@ -1086,19 +1114,22 @@ class TradingModelPipeline:
             
             # 4. Calculate overall metrics
             duration = time.time() - start_time
+            successful_symbols = [s for s, r in overall_results.items() if r]
             avg_metrics = {
                 'accuracy': np.mean([r['ensemble']['metrics']['accuracy'] 
-                                   for r in overall_results.values()]),
+                                   for r in overall_results.values() if r]),
                 'f1': np.mean([r['ensemble']['metrics']['f1'] 
-                             for r in overall_results.values()]),
+                             for r in overall_results.values() if r]),
                 'precision': np.mean([r['ensemble']['metrics']['precision'] 
-                                   for r in overall_results.values()]),
+                                   for r in overall_results.values() if r]),
                 'recall': np.mean([r['ensemble']['metrics']['recall'] 
-                                 for r in overall_results.values()]),
-                'num_symbols': len(overall_results)
+                                 for r in overall_results.values() if r]),
+                'num_symbols': len(successful_symbols),
+                'failed_symbols': len(symbols) - len(successful_symbols)
             }
             
             # 5. Save training metadata
+            config_dict = {k: v for k, v in vars(Config).items() if not k.startswith('__')}
             self.db.execute_query(
                 """
                 INSERT INTO training_metadata 
@@ -1110,7 +1141,7 @@ class TradingModelPipeline:
                     ['lightgbm', 'xgboost', 'random_forest', 'ensemble'],
                     json.dumps(avg_metrics),
                     duration,
-                    json.dumps(vars(Config))
+                    json.dumps(config_dict)
                 )
             )
             
@@ -1122,20 +1153,20 @@ class TradingModelPipeline:
             if config('TELEGRAM_BOT_TOKEN', default=None) and config('TELEGRAM_CHAT_ID', default=None):
                 self.send_telegram_notification(
                     f"✅ *Training Completed*\n\n"
-                    f"• Symbols: {len(overall_results)}\n"
+                    f"• Symbols: {len(successful_symbols)}/{len(symbols)}\n"
                     f"• Duration: {duration:.2f}s\n"
                     f"• Avg F1: {avg_metrics['f1']:.4f}\n"
                     f"• Avg Accuracy: {avg_metrics['accuracy']:.4f}"
                 )
             
             logger.info(f"🏁 Training completed in {duration:.2f} seconds")
+            logger.info(f"📊 Results: {avg_metrics}")
             return overall_results
             
         except Exception as e:
             self.training_status = "Failed"
             logger.error(f"❌ Pipeline failed: {e}")
             
-            # Send error notification
             if config('TELEGRAM_BOT_TOKEN', default=None) and config('TELEGRAM_CHAT_ID', default=None):
                 self.send_telegram_notification(
                     f"❌ *Training Failed*\n\nError: {str(e)}"
@@ -1145,7 +1176,7 @@ class TradingModelPipeline:
             self.db.close()
 
     def send_telegram_notification(self, message: str):
-        """Send notification via Telegram"""
+        """Send notification via Telegram with error handling"""
         try:
             requests.post(
                 f"https://api.telegram.org/bot{config('TELEGRAM_BOT_TOKEN')}/sendMessage",
@@ -1167,7 +1198,7 @@ def get_status():
     pipeline = TradingModelPipeline()
     return jsonify({
         'status': pipeline.training_status,
-        'last_training_time': pipeline.last_training_time,
+        'last_training_time': pipeline.last_training_time.isoformat() if pipeline.last_training_time else None,
         'metrics': pipeline.training_metrics,
         'symbols_trained': len(pipeline.current_models)
     })
@@ -1181,14 +1212,17 @@ def predict(symbol: str):
     
     try:
         data = request.get_json()
+        if 'features' not in data:
+            return jsonify({'error': 'Missing features in request'}), 400
+        
         features = pd.DataFrame([data['features']])
         
-        # Scale features (would need to load scaler from training)
-        # scaled_features = pipeline.scaler.transform(features)
+        # In production, you would load the scaler used during training
+        # features_scaled = pipeline.scaler.transform(features)
         
         model = pipeline.current_models[symbol]
         prediction = model.predict(features)
-        probabilities = model.predict_proba(features).tolist()[0]
+        probabilities = model.predict_proba(features).tolist()[0] if hasattr(model, 'predict_proba') else None
         
         # Save prediction to database
         pipeline.db.execute_query(
@@ -1201,7 +1235,7 @@ def predict(symbol: str):
                 symbol,
                 datetime.now(),
                 int(prediction[0]),
-                float(max(probabilities)),
+                float(max(probabilities)) if probabilities else 0.0,
                 json.dumps(data['features']),
                 type(model).__name__
             )
@@ -1210,25 +1244,61 @@ def predict(symbol: str):
         return jsonify({
             'symbol': symbol,
             'prediction': int(prediction[0]),
-            'confidence': float(max(probabilities)),
+            'confidence': float(max(probabilities)) if probabilities else 0.0,
             'probabilities': probabilities,
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    })
+
 def run_flask():
-    app.run(host='0.0.0.0', port=Config.FLASK_PORT)
+    """Run Flask API with production-ready settings"""
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=Config.FLASK_PORT, threads=6)
 
 # ---------------------- Main Execution ----------------------
 if __name__ == "__main__":
-    # Start Flask API in a separate thread
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Run main training pipeline
-    pipeline = TradingModelPipeline()
-    pipeline.run_pipeline()
-    
-    # Keep application running
-    flask_thread.join()
+    try:
+        # Initialize components
+        logger.info("🚀 Starting Enhanced ML Trading System")
+        
+        # Validate Binance connection
+        data_fetcher = BinanceDataFetcher()
+        try:
+            data_fetcher.client.ping()
+            logger.info("✅ Binance connection validated")
+        except Exception as e:
+            logger.critical(f"❌ Failed to connect to Binance: {e}")
+            exit(1)
+        
+        # Initialize database
+        db = DatabaseManager()
+        if not db._connect():
+            exit(1)
+        
+        # Start Flask API in a separate thread
+        flask_thread = Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        logger.info(f"🌐 Flask API running on port {Config.FLASK_PORT}")
+        
+        # Run main training pipeline
+        pipeline = TradingModelPipeline()
+        pipeline.run_pipeline()
+        
+        # Keep application running
+        flask_thread.join()
+        
+    except KeyboardInterrupt:
+        logger.info("🛑 Shutting down gracefully...")
+    except Exception as e:
+        logger.critical(f"❌ Fatal error: {e}")
+        exit(1)
+    finally:
+        logger.info("👋 System shutdown completed")
