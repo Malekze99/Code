@@ -32,3 +32,4 @@ imbalanced-learn
 optuna
 ta>=0.11.0
 matplotlib
+shap
