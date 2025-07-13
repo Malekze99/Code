@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import psycopg2
 import pickle
+import math
 from psycopg2 import sql, OperationalError, InterfaceError
 from psycopg2.extras import RealDictCursor
 from binance.client import Client
@@ -16,6 +17,7 @@ from datetime import datetime, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Tuple, Union
 from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
                             f1_score, confusion_matrix, classification_report,
                             roc_auc_score, average_precision_score)
@@ -58,6 +60,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('EnhancedMLTrading')
+
+# إضافة handler منفصل للأخطاء
+error_handler = logging.FileHandler('enhanced_ml_trading_errors.log', encoding='utf-8')
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(error_handler)
 
 # ---------------------- Configuration ----------------------
 class Config:
@@ -207,12 +215,19 @@ class DatabaseManager:
     
     def execute_query(self, query: str, params: tuple = None, fetch: bool = False):
         try:
+            if not self.conn or self.conn.closed:
+                self._connect()
+                
             with self._lock:
                 self.cur.execute(query, params)
                 if fetch:
                     return self.cur.fetchall()
                 self.conn.commit()
                 return True
+        except (OperationalError, InterfaceError) as e:
+            logger.error(f"Database connection error: {e}")
+            self._connect()  # Attempt to reconnect
+            return False
         except Exception as e:
             self.conn.rollback()
             logger.error(f"❌ Query failed: {e}\nQuery: {query}\nParams: {params}")
@@ -392,140 +407,148 @@ class FeatureEngineer:
     @staticmethod
     def add_ta_features(df: pd.DataFrame) -> pd.DataFrame:
         """Add comprehensive technical indicators"""
+        if len(df) < 50:
+            logger.warning("Insufficient data for TA features")
+            return df
+            
         df = df.copy()
         
-        # Price Transformations
-        df['log_price'] = np.log(df['close'])
-        df['returns'] = df['close'].pct_change()
-        df['cumulative_returns'] = (1 + df['returns']).cumprod()
-        
-        # Momentum Indicators
-        df['rsi'] = RSIIndicator(df['close'], Config.RSI_PERIOD).rsi()
-        stoch = StochasticOscillator(df['high'], df['low'], df['close'], 14, 3)
-        df['stoch_k'] = stoch.stoch()
-        df['stoch_d'] = stoch.stoch_signal()
-        df['tsi'] = TSIIndicator(df['close'], 25, 13).tsi()
-        df['ultimate_osc'] = UltimateOscillator(
-            df['high'], df['low'], df['close'], 7, 14, 28
-        ).ultimate_oscillator()
-        df['roc'] = ROCIndicator(df['close'], 12).roc()
-        
-        # Trend Indicators
-        macd = MACD(df['close'], Config.MACD_FAST, Config.MACD_SLOW, Config.MACD_SIGNAL)
-        df['macd'] = macd.macd()
-        df['macd_signal'] = macd.macd_signal()
-        df['macd_diff'] = macd.macd_diff()
-        
-        df['adx'] = ADXIndicator(
-            df['high'], df['low'], df['close'], Config.ADX_PERIOD
-        ).adx()
-        df['plus_di'] = ADXIndicator(
-            df['high'], df['low'], df['close'], Config.ADX_PERIOD
-        ).adx_pos()
-        df['minus_di'] = ADXIndicator(
-            df['high'], df['low'], df['close'], Config.ADX_PERIOD
-        ).adx_neg()
-        
-        df['ema_20'] = EMAIndicator(df['close'], 20).ema_indicator()
-        df['ema_50'] = EMAIndicator(df['close'], 50).ema_indicator()
-        df['ema_200'] = EMAIndicator(df['close'], 200).ema_indicator()
-        df['sma_50'] = SMAIndicator(df['close'], 50).sma_indicator()
-        df['sma_200'] = SMAIndicator(df['close'], 200).sma_indicator()
-        
-        ichimoku = IchimokuIndicator(
-            df['high'], df['low'],
-            9, 26, 52  # Using standard Ichimoku settings
-        )
-        df['ichimoku_conv'] = ichimoku.ichimoku_conversion_line()
-        df['ichimoku_base'] = ichimoku.ichimoku_base_line()
-        df['ichimoku_a'] = ichimoku.ichimoku_a()
-        df['ichimoku_b'] = ichimoku.ichimoku_b()
-        
-        aroon = AroonIndicator(df['high'], df['low'], 14)
-        df['aroon_up'] = aroon.aroon_up()
-        df['aroon_down'] = aroon.aroon_down()
-        
-        # Volume Indicators
-        df['vwap'] = VolumeWeightedAveragePrice(
-            df['high'], df['low'], df['close'], df['volume'], Config.VWAP_WINDOW
-        ).volume_weighted_average_price()
-        
-        df['adi'] = AccDistIndexIndicator(
-            df['high'], df['low'], df['close'], df['volume']
-        ).acc_dist_index()
-        
-        df['cmf'] = ChaikinMoneyFlowIndicator(
-            df['high'], df['low'], df['close'], df['volume'], 20
-        ).chaikin_money_flow()
-        
-        df['eom'] = EaseOfMovementIndicator(
-            df['high'], df['low'], df['volume'], 14
-        ).ease_of_movement()
-        
-        # Volatility Indicators
-        bb = BollingerBands(df['close'], Config.BB_WINDOW)
-        df['bb_upper'] = bb.bollinger_hband()
-        df['bb_middle'] = bb.bollinger_mband()
-        df['bb_lower'] = bb.bollinger_lband()
-        df['bb_width'] = bb.bollinger_wband()
-        df['bb_pct'] = bb.bollinger_pband()
-        
-        df['atr'] = AverageTrueRange(
-            df['high'], df['low'], df['close'], Config.ATR_WINDOW
-        ).average_true_range()
-        
-        dc = DonchianChannel(df['high'], df['low'], df['close'], 20)
-        df['dc_upper'] = dc.donchian_channel_hband()
-        df['dc_lower'] = dc.donchian_channel_lband()
-        
-        kc = KeltnerChannel(
-            df['high'], df['low'], df['close'], 20, 2
-        )
-        df['kc_upper'] = kc.keltner_channel_hband()
-        df['kc_middle'] = kc.keltner_channel_mband()
-        df['kc_lower'] = kc.keltner_channel_lband()
-        
-        # Other Indicators
-        df['daily_log_return'] = DailyLogReturnIndicator(df['close']).daily_log_return()
-        df['daily_return'] = DailyReturnIndicator(df['close']).daily_return()
-        df['cumulative_return'] = CumulativeReturnIndicator(df['close']).cumulative_return()
-        
-        # Derived Features
-        df['price_vwap_diff'] = df['close'] - df['vwap']
-        df['ema_20_50_diff'] = df['ema_20'] - df['ema_50']
-        df['ema_50_200_diff'] = df['ema_50'] - df['ema_200']
-        df['high_low_spread'] = df['high'] - df['low']
-        df['open_close_spread'] = df['close'] - df['open']
-        df['volume_spike'] = (df['volume'] / df['volume'].rolling(20).mean() - 1)
-        
-        # Lag Features
-        for lag in [1, 2, 3, 5, 10, 20]:
-            df[f'price_lag_{lag}'] = df['close'].shift(lag)
-            df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
-            df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
-        
-        # Rolling Features
-        windows = [5, 10, 20, 50]
-        for window in windows:
-            df[f'rolling_mean_{window}'] = df['close'].rolling(window).mean()
-            df[f'rolling_std_{window}'] = df['close'].rolling(window).std()
-            df[f'rolling_min_{window}'] = df['low'].rolling(window).min()
-            df[f'rolling_max_{window}'] = df['high'].rolling(window).max()
-            df[f'rolling_volume_mean_{window}'] = df['volume'].rolling(window).mean()
-            df[f'rolling_volume_std_{window}'] = df['volume'].rolling(window).std()
-        
-        # Window-based Features
-        df['z_score_20'] = (df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).std()
-        df['momentum_10'] = df['close'] / df['close'].shift(10) - 1
-        df['volatility_20'] = df['returns'].rolling(20).std()
-        
-        # Date/Time Features
-        df['hour'] = df.index.hour
-        df['day_of_week'] = df.index.dayofweek
-        df['day_of_month'] = df.index.day
-        df['is_weekend'] = df.index.dayofweek >= 5
-        
-        return df
+        try:
+            # Price Transformations
+            df['log_price'] = np.log(df['close'])
+            df['returns'] = df['close'].pct_change()
+            df['cumulative_returns'] = (1 + df['returns']).cumprod()
+            
+            # Momentum Indicators
+            df['rsi'] = RSIIndicator(df['close'], Config.RSI_PERIOD).rsi()
+            stoch = StochasticOscillator(df['high'], df['low'], df['close'], 14, 3)
+            df['stoch_k'] = stoch.stoch()
+            df['stoch_d'] = stoch.stoch_signal()
+            df['tsi'] = TSIIndicator(df['close'], 25, 13).tsi()
+            df['ultimate_osc'] = UltimateOscillator(
+                df['high'], df['low'], df['close'], 7, 14, 28
+            ).ultimate_oscillator()
+            df['roc'] = ROCIndicator(df['close'], 12).roc()
+            
+            # Trend Indicators
+            macd = MACD(df['close'], Config.MACD_FAST, Config.MACD_SLOW, Config.MACD_SIGNAL)
+            df['macd'] = macd.macd()
+            df['macd_signal'] = macd.macd_signal()
+            df['macd_diff'] = macd.macd_diff()
+            
+            df['adx'] = ADXIndicator(
+                df['high'], df['low'], df['close'], Config.ADX_PERIOD
+            ).adx()
+            df['plus_di'] = ADXIndicator(
+                df['high'], df['low'], df['close'], Config.ADX_PERIOD
+            ).adx_pos()
+            df['minus_di'] = ADXIndicator(
+                df['high'], df['low'], df['close'], Config.ADX_PERIOD
+            ).adx_neg()
+            
+            df['ema_20'] = EMAIndicator(df['close'], 20).ema_indicator()
+            df['ema_50'] = EMAIndicator(df['close'], 50).ema_indicator()
+            df['ema_200'] = EMAIndicator(df['close'], 200).ema_indicator()
+            df['sma_50'] = SMAIndicator(df['close'], 50).sma_indicator()
+            df['sma_200'] = SMAIndicator(df['close'], 200).sma_indicator()
+            
+            ichimoku = IchimokuIndicator(
+                df['high'], df['low'],
+                9, 26, 52  # Using standard Ichimoku settings
+            )
+            df['ichimoku_conv'] = ichimoku.ichimoku_conversion_line()
+            df['ichimoku_base'] = ichimoku.ichimoku_base_line()
+            df['ichimoku_a'] = ichimoku.ichimoku_a()
+            df['ichimoku_b'] = ichimoku.ichimoku_b()
+            
+            aroon = AroonIndicator(df['high'], df['low'], 14)
+            df['aroon_up'] = aroon.aroon_up()
+            df['aroon_down'] = aroon.aroon_down()
+            
+            # Volume Indicators
+            df['vwap'] = VolumeWeightedAveragePrice(
+                df['high'], df['low'], df['close'], df['volume'], Config.VWAP_WINDOW
+            ).volume_weighted_average_price()
+            
+            df['adi'] = AccDistIndexIndicator(
+                df['high'], df['low'], df['close'], df['volume']
+            ).acc_dist_index()
+            
+            df['cmf'] = ChaikinMoneyFlowIndicator(
+                df['high'], df['low'], df['close'], df['volume'], 20
+            ).chaikin_money_flow()
+            
+            df['eom'] = EaseOfMovementIndicator(
+                df['high'], df['low'], df['volume'], 14
+            ).ease_of_movement()
+            
+            # Volatility Indicators
+            bb = BollingerBands(df['close'], Config.BB_WINDOW)
+            df['bb_upper'] = bb.bollinger_hband()
+            df['bb_middle'] = bb.bollinger_mband()
+            df['bb_lower'] = bb.bollinger_lband()
+            df['bb_width'] = bb.bollinger_wband()
+            df['bb_pct'] = bb.bollinger_pband()
+            
+            df['atr'] = AverageTrueRange(
+                df['high'], df['low'], df['close'], Config.ATR_WINDOW
+            ).average_true_range()
+            
+            dc = DonchianChannel(df['high'], df['low'], df['close'], 20)
+            df['dc_upper'] = dc.donchian_channel_hband()
+            df['dc_lower'] = dc.donchian_channel_lband()
+            
+            kc = KeltnerChannel(
+                df['high'], df['low'], df['close'], 20, 2
+            )
+            df['kc_upper'] = kc.keltner_channel_hband()
+            df['kc_middle'] = kc.keltner_channel_mband()
+            df['kc_lower'] = kc.keltner_channel_lband()
+            
+            # Other Indicators
+            df['daily_log_return'] = DailyLogReturnIndicator(df['close']).daily_log_return()
+            df['daily_return'] = DailyReturnIndicator(df['close']).daily_return()
+            df['cumulative_return'] = CumulativeReturnIndicator(df['close']).cumulative_return()
+            
+            # Derived Features
+            df['price_vwap_diff'] = df['close'] - df['vwap']
+            df['ema_20_50_diff'] = df['ema_20'] - df['ema_50']
+            df['ema_50_200_diff'] = df['ema_50'] - df['ema_200']
+            df['high_low_spread'] = df['high'] - df['low']
+            df['open_close_spread'] = df['close'] - df['open']
+            df['volume_spike'] = (df['volume'] / df['volume'].rolling(20).mean() - 1)
+            
+            # Lag Features
+            for lag in [1, 2, 3, 5, 10, 20]:
+                df[f'price_lag_{lag}'] = df['close'].shift(lag)
+                df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
+                df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
+            
+            # Rolling Features
+            windows = [5, 10, 20, 50]
+            for window in windows:
+                df[f'rolling_mean_{window}'] = df['close'].rolling(window).mean()
+                df[f'rolling_std_{window}'] = df['close'].rolling(window).std()
+                df[f'rolling_min_{window}'] = df['low'].rolling(window).min()
+                df[f'rolling_max_{window}'] = df['high'].rolling(window).max()
+                df[f'rolling_volume_mean_{window}'] = df['volume'].rolling(window).mean()
+                df[f'rolling_volume_std_{window}'] = df['volume'].rolling(window).std()
+            
+            # Window-based Features
+            df['z_score_20'] = (df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).std()
+            df['momentum_10'] = df['close'] / df['close'].shift(10) - 1
+            df['volatility_20'] = df['returns'].rolling(20).std()
+            
+            # Date/Time Features
+            df['hour'] = df.index.hour
+            df['day_of_week'] = df.index.dayofweek
+            df['day_of_month'] = df.index.day
+            df['is_weekend'] = df.index.dayofweek >= 5
+            
+            return df
+        except Exception as e:
+            logger.error(f"Error calculating TA features: {e}")
+            return df
 
     @staticmethod
     def add_market_context(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
@@ -693,17 +716,19 @@ class ModelTrainer:
         if params:
             default_params.update(params)
         
-        train_data = lgb.Dataset(X_train, label=y_train)
-        val_data = lgb.Dataset(X_val, label=y_val) if X_val is not None else None
+        model = lgb.LGBMClassifier(**default_params)
         
-        return lgb.train(
-            default_params,
-            train_data,
-            valid_sets=[val_data] if val_data else None,
-            num_boost_round=1000,
-            early_stopping_rounds=Config.EARLY_STOPPING_ROUNDS if val_data else None,
-            verbose_eval=50
-        )
+        if X_val is not None:
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                early_stopping_rounds=Config.EARLY_STOPPING_ROUNDS,
+                verbose=50
+            )
+        else:
+            model.fit(X_train, y_train)
+        
+        return model
 
     @staticmethod
     def train_xgboost(X_train: pd.DataFrame, y_train: pd.Series,
@@ -802,6 +827,12 @@ class ModelTrainer:
 # ---------------------- Model Evaluation ----------------------
 class ModelEvaluator:
     @staticmethod
+    def replace_nan_with_none(metrics):
+        """Replace NaN values with None in metrics dictionary"""
+        return {k: (None if isinstance(v, float) and math.isnan(v) else v) 
+                for k, v in metrics.items()}
+
+    @staticmethod
     def evaluate_model(model: Any, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, Any]:
         """Comprehensive model evaluation"""
         y_pred = model.predict(X_test)
@@ -819,7 +850,7 @@ class ModelEvaluator:
             'probabilities': y_proba.tolist() if y_proba is not None else None
         }
         
-        return metrics
+        return ModelEvaluator.replace_nan_with_none(metrics)
 
     @staticmethod
     def cross_validate(model: Any, X: pd.DataFrame, y: pd.Series, 
@@ -845,7 +876,7 @@ class ModelEvaluator:
             scores['recall'].append(recall_score(y_test, y_pred, average='weighted'))
             scores['f1'].append(f1_score(y_test, y_pred, average='weighted'))
         
-        return {k: np.mean(v) for k, v in scores.items()}
+        return {k: np.nanmean(v) for k, v in scores.items()}
 
     @staticmethod
     def calculate_feature_importance(model: Any, feature_names: List[str]) -> Dict[str, float]:
@@ -903,13 +934,24 @@ class TradingModelPipeline:
                 raw_symbols = [line.strip().upper() for line in f 
                              if line.strip() and not line.startswith('#')]
                 
-            # Validate symbols with Binance
+            # التحقق من صحة الرموز مع Binance
             valid_symbols = []
+            invalid_symbols = []
+            
             for symbol in raw_symbols[:Config.MAX_SYMBOLS]:
-                if self.data_fetcher.validate_symbol(symbol):
-                    valid_symbols.append(symbol)
-                else:
-                    logger.warning(f"Removing invalid symbol: {symbol}")
+                try:
+                    # إضافة USDT افتراضياً إذا لم يكن موجوداً
+                    full_symbol = symbol if 'USDT' in symbol else f"{symbol}USDT"
+                    if self.data_fetcher.validate_symbol(full_symbol):
+                        valid_symbols.append(full_symbol)
+                    else:
+                        invalid_symbols.append(symbol)
+                except Exception as e:
+                    logger.warning(f"Error validating symbol {symbol}: {e}")
+                    invalid_symbols.append(symbol)
+            
+            if invalid_symbols:
+                logger.warning(f"Removed invalid symbols: {invalid_symbols}")
             
             self.symbols = valid_symbols
             return valid_symbols
@@ -1091,9 +1133,16 @@ class TradingModelPipeline:
             logger.info(f"Starting training for {len(symbols)} valid symbols: {symbols}")
             
             # 2. Pre-fetch BTC data for market context
-            btc_data = self.data_fetcher.fetch_enhanced_data(
-                "BTCUSDT", Config.SIGNAL_TIMEFRAME, Config.DATA_LOOKBACK_DAYS
-            )
+            try:
+                btc_data = self.data_fetcher.fetch_enhanced_data(
+                    "BTCUSDT", Config.SIGNAL_TIMEFRAME, Config.DATA_LOOKBACK_DAYS
+                )
+                if btc_data is None or len(btc_data) < 100:
+                    logger.warning("Insufficient BTC data, proceeding without market context")
+                    btc_data = None
+            except Exception as e:
+                logger.error(f"Failed to fetch BTC data: {e}")
+                btc_data = None
             
             # 3. Train models in parallel with error handling
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -1109,24 +1158,38 @@ class TradingModelPipeline:
                         if result:
                             overall_results[symbol] = result
                             self.current_models[symbol] = result['ensemble']['model']
+                        else:
+                            logger.warning(f"Training failed for {symbol} (no result returned)")
                     except Exception as e:
                         logger.error(f"Error processing {symbol}: {e}")
             
             # 4. Calculate overall metrics
             duration = time.time() - start_time
             successful_symbols = [s for s, r in overall_results.items() if r]
-            avg_metrics = {
-                'accuracy': np.mean([r['ensemble']['metrics']['accuracy'] 
-                                   for r in overall_results.values() if r]),
-                'f1': np.mean([r['ensemble']['metrics']['f1'] 
-                             for r in overall_results.values() if r]),
-                'precision': np.mean([r['ensemble']['metrics']['precision'] 
-                                   for r in overall_results.values() if r]),
-                'recall': np.mean([r['ensemble']['metrics']['recall'] 
-                                 for r in overall_results.values() if r]),
-                'num_symbols': len(successful_symbols),
-                'failed_symbols': len(symbols) - len(successful_symbols)
-            }
+            
+            # Handle case where no models were trained successfully
+            if not successful_symbols:
+                avg_metrics = {
+                    'accuracy': None,
+                    'f1': None,
+                    'precision': None,
+                    'recall': None,
+                    'num_symbols': 0,
+                    'failed_symbols': len(symbols)
+                }
+            else:
+                avg_metrics = {
+                    'accuracy': np.nanmean([r['ensemble']['metrics']['accuracy'] 
+                                         for r in overall_results.values() if r]),
+                    'f1': np.nanmean([r['ensemble']['metrics']['f1'] 
+                                     for r in overall_results.values() if r]),
+                    'precision': np.nanmean([r['ensemble']['metrics']['precision'] 
+                                           for r in overall_results.values() if r]),
+                    'recall': np.nanmean([r['ensemble']['metrics']['recall'] 
+                                         for r in overall_results.values() if r]),
+                    'num_symbols': len(successful_symbols),
+                    'failed_symbols': len(symbols) - len(successful_symbols)
+                }
             
             # 5. Save training metadata
             config_dict = {k: v for k, v in vars(Config).items() if not k.startswith('__')}
@@ -1139,7 +1202,7 @@ class TradingModelPipeline:
                 (
                     list(overall_results.keys()),
                     ['lightgbm', 'xgboost', 'random_forest', 'ensemble'],
-                    json.dumps(avg_metrics),
+                    json.dumps(self.model_evaluator.replace_nan_with_none(avg_metrics)),
                     duration,
                     json.dumps(config_dict)
                 )
@@ -1155,8 +1218,8 @@ class TradingModelPipeline:
                     f"✅ *Training Completed*\n\n"
                     f"• Symbols: {len(successful_symbols)}/{len(symbols)}\n"
                     f"• Duration: {duration:.2f}s\n"
-                    f"• Avg F1: {avg_metrics['f1']:.4f}\n"
-                    f"• Avg Accuracy: {avg_metrics['accuracy']:.4f}"
+                    f"• Avg F1: {avg_metrics['f1']:.4f if avg_metrics['f1'] is not None else 'N/A'}\n"
+                    f"• Avg Accuracy: {avg_metrics['accuracy']:.4f if avg_metrics['accuracy'] is not None else 'N/A'}"
                 )
             
             logger.info(f"🏁 Training completed in {duration:.2f} seconds")
@@ -1212,19 +1275,31 @@ def predict(symbol: str):
     
     try:
         data = request.get_json()
-        if 'features' not in data:
+        if not data or 'features' not in data:
             return jsonify({'error': 'Missing features in request'}), 400
         
+        # التحقق من أن الميزات هي قاموس
+        if not isinstance(data['features'], dict):
+            return jsonify({'error': 'Features must be a dictionary'}), 400
+            
         features = pd.DataFrame([data['features']])
         
-        # In production, you would load the scaler used during training
-        # features_scaled = pipeline.scaler.transform(features)
-        
+        # التحقق من تطابق أسماء الميزات
         model = pipeline.current_models[symbol]
+        expected_features = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else []
+        
+        if set(features.columns) != set(expected_features):
+            return jsonify({
+                'error': 'Feature mismatch',
+                'expected': list(expected_features),
+                'received': list(features.columns)
+            }), 400
+            
+        # التنبؤ
         prediction = model.predict(features)
         probabilities = model.predict_proba(features).tolist()[0] if hasattr(model, 'predict_proba') else None
         
-        # Save prediction to database
+        # حفظ التنبؤ في قاعدة البيانات
         pipeline.db.execute_query(
             """
             INSERT INTO enhanced_signals 
@@ -1249,6 +1324,7 @@ def predict(symbol: str):
             'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
+        logger.error(f"Prediction error for {symbol}: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
