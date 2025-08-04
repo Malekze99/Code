@@ -642,9 +642,114 @@ class TradingModelPipeline:
         finally:
             self.training_status = "Idle"
 
-    def run_pipeline(self):
-        # ... (pipeline execution logic is mostly fine, just ensure it uses self.db etc.)
-        pass
+        def run_pipeline(self):
+        """
+        Run the complete training pipeline: load symbols, fetch data, train models in parallel,
+        and save results and metadata.
+        """
+        start_time = time.time()
+        self.training_status = "Running"
+        self.last_training_time = datetime.now()
+        overall_results = {}
+        
+        try:
+            # 1. Load and validate symbols
+            self.symbols = self.load_symbols()
+            if not self.symbols:
+                raise ValueError("No valid symbols found to train on.")
+            
+            logger.info(f"Starting training for {len(self.symbols)} valid symbols: {self.symbols}")
+            
+            # 2. Pre-fetch BTC data for market context
+            btc_data = None
+            try:
+                btc_data = self.data_fetcher.fetch_enhanced_data(
+                    "BTCUSDT", Config.SIGNAL_TIMEFRAME, Config.DATA_LOOKBACK_DAYS
+                )
+                if btc_data is None or len(btc_data) < 200:
+                    logger.warning("Insufficient BTC data, proceeding without market context features.")
+                    btc_data = None
+            except Exception as e:
+                logger.error(f"Failed to fetch BTC data, proceeding without it: {e}")
+            
+            # 3. Train models in parallel
+            with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+                # Create a future for each symbol training task
+                futures = {
+                    executor.submit(self.train_symbol_model, symbol, btc_data): symbol
+                    for symbol in self.symbols
+                }
+                
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            overall_results[symbol] = result
+                            # Store the best model (ensemble) in memory for prediction API
+                            if 'ensemble' in result and result['ensemble']['model']:
+                                self.current_models[symbol] = result['ensemble']['model']
+                            logger.info(f"✅ Successfully processed training for {symbol}")
+                        else:
+                            logger.warning(f"Training for {symbol} did not return any results.")
+                    except Exception as e:
+                        logger.error(f"An error occurred while processing the result for {symbol}: {e}", exc_info=True)
+            
+            # 4. Calculate and log overall metrics
+            duration = time.time() - start_time
+            successful_symbols = list(overall_results.keys())
+            
+            if not successful_symbols:
+                logger.warning("Training pipeline ran but no models were successfully trained.")
+                avg_metrics = {'f1': 0, 'accuracy': 0}
+            else:
+                avg_metrics = {
+                    'accuracy': np.nanmean([r['ensemble']['metrics']['accuracy'] for r in overall_results.values() if r.get('ensemble')]),
+                    'f1': np.nanmean([r['ensemble']['metrics']['f1'] for r in overall_results.values() if r.get('ensemble')]),
+                    'precision': np.nanmean([r['ensemble']['metrics']['precision'] for r in overall_results.values() if r.get('ensemble')]),
+                    'recall': np.nanmean([r['ensemble']['metrics']['recall'] for r in overall_results.values() if r.get('ensemble')])
+                }
+
+            self.training_metrics = self.model_evaluator.replace_nan_with_none(avg_metrics)
+            
+            # 5. Save training metadata to database
+            config_dict = {k: v for k, v in vars(Config).items() if not k.startswith('__')}
+            metadata_payload = (
+                successful_symbols,
+                ['lightgbm', 'xgboost', 'random_forest', 'ensemble'],
+                json.dumps(self.training_metrics),
+                duration,
+                json.dumps(config_dict)
+            )
+            self.db.execute_query(
+                """
+                INSERT INTO training_metadata 
+                (symbols, model_types, avg_metrics, duration_seconds, parameters)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                metadata_payload
+            )
+            
+            self.training_status = "Completed"
+            notification_message = (
+                f"✅ *Training Pipeline Completed*\n\n"
+                f"• *Duration*: {duration:.2f} seconds\n"
+                f"• *Symbols Trained*: {len(successful_symbols)} / {len(self.symbols)}\n"
+                f"• *Avg F1-Score*: {self.training_metrics.get('f1', 'N/A'):.4f}\n"
+                f"• *Avg Accuracy*: {self.training_metrics.get('accuracy', 'N/A'):.4f}"
+            )
+            logger.info(f"🏁 Training completed. Results: {self.training_metrics}")
+
+        except Exception as e:
+            self.training_status = "Failed"
+            notification_message = f"❌ *Training Pipeline Failed*\n\n*Error*: `{str(e)}`"
+            logger.critical(f"❌ The entire training pipeline failed: {e}", exc_info=True)
+        
+        finally:
+            # Send notification regardless of outcome
+            if config('TELEGRAM_BOT_TOKEN', default=None) and config('TELEGRAM_CHAT_ID', default=None):
+                self.send_telegram_notification(notification_message)
+
 
 # ---------------------- Flask API ----------------------
 # ARCHITECTURAL FIX: Instantiate the pipeline ONCE and share it across requests.
