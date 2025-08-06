@@ -20,17 +20,20 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from flask import Flask
 from threading import Thread
+from sklearn.model_selection import ParameterGrid
+from sklearn.utils import resample
+from scipy import stats
 
 # ---------------------- إعداد نظام التسجيل (Logging) ----------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('ml_model_trainer_v5.log', encoding='utf-8'),
+        logging.FileHandler('ml_model_trainer_v6.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('MLTrainer_V5')
+logger = logging.getLogger('MLTrainer_V6')
 
 # ---------------------- تحميل متغيرات البيئة ----------------------
 try:
@@ -44,7 +47,7 @@ except Exception as e:
      exit(1)
 
 # ---------------------- إعداد الثوابت والمتغيرات العامة ----------------------
-BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V5'
+BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V6'
 SIGNAL_GENERATION_TIMEFRAME: str = '15m'
 DATA_LOOKBACK_DAYS_FOR_TRAINING: int = 120
 BTC_SYMBOL = 'BTCUSDT'
@@ -71,12 +74,19 @@ TP_ATR_MULTIPLIER: float = 2.0
 SL_ATR_MULTIPLIER: float = 1.5
 MAX_HOLD_PERIOD: int = 24
 
+# فئات التقلب للأزواج
+VOLATILITY_CATEGORIES = {
+    'high': ['HOOKUSDT', 'ALTUSDT', 'ZROUSDT', 'PENDLEUSDT', 'DYDXUSDT'],
+    'medium': ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT'],
+    'low': ['USDCUSDT', 'USDTUSD', 'DAIUSDT', 'BUSDUSDT']
+}
+
 # Global variables
 conn: Optional[psycopg2.extensions.connection] = None
 client: Optional[Client] = None
 btc_data_cache: Optional[pd.DataFrame] = None
 
-# --- دوال الاتصال والتحقق ---
+# ---------------------- دوال الاتصال والتحقق ----------------------
 def init_db():
     global conn
     try:
@@ -122,7 +132,7 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
     except Exception as e:
         logger.error(f"❌ [Validation] خطأ في التحقق من الرموز: {e}"); return []
 
-# --- دوال جلب ومعالجة البيانات ---
+# ---------------------- دوال جلب ومعالجة البيانات ----------------------
 def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     try:
         start_str = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -145,49 +155,6 @@ def fetch_and_cache_btc_data():
         logger.critical("❌ [BTC Data] فشل جلب بيانات البيتكوين."); exit(1)
     btc_data_cache['btc_returns'] = btc_data_cache['close'].pct_change()
 
-# --- دوال حساب المؤشرات الفنية المتقدمة ---
-def calculate_adx(high, low, close, window=14):
-    """حساب مؤشر ADX يدوياً"""
-    up = high.diff()
-    down = -low.diff()
-    
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    
-    tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift()), np.abs(low - close.shift())))
-    
-    atr = tr.rolling(window).mean()
-    plus_di = 100 * (plus_dm.rolling(window).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window).mean() / atr)
-    
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.rolling(window).mean()
-    return adx, plus_di, minus_di
-
-def calculate_mfi(high, low, close, volume, window=14):
-    """حساب مؤشر MFI يدوياً"""
-    typical_price = (high + low + close) / 3
-    money_flow = typical_price * volume
-    
-    positive_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0)
-    negative_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0)
-    
-    pos_flow_sum = positive_flow.rolling(window).sum()
-    neg_flow_sum = negative_flow.rolling(window).sum()
-    
-    # التصحيح: إزالة الأقواس الزائدة
-    money_ratio = pos_flow_sum / (neg_flow_sum + 1e-9)
-    mfi = 100 - (100 / (1 + money_ratio))
-    return mfi
-
-def calculate_cci(high, low, close, window=20):
-    """حساب مؤشر CCI يدوياً"""
-    tp = (high + low + close) / 3
-    sma = tp.rolling(window).mean()
-    mad = tp.rolling(window).apply(lambda x: np.abs(x - x.mean()).mean())
-    cci = (tp - sma) / (0.015 * (mad + 1e-9))
-    return cci
-
 def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc = df.copy()
 
@@ -202,7 +169,7 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     delta = df_calc['close'].diff()
     gain = delta.clip(lower=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
     loss = -delta.clip(upper=0).ewm(com=RSI_PERIOD - 1, adjust=False).mean()
-    df_calc['rsi'] = 100 - (100 / (1 + (gain / (loss.replace(0, 1e-9))))
+    df_calc['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, 1e-9))))
 
     # MACD and MACD Cross
     ema_fast = df_calc['close'].ewm(span=MACD_FAST, adjust=False).mean()
@@ -247,261 +214,162 @@ def calculate_features(df: pd.DataFrame, btc_df: pd.DataFrame) -> pd.DataFrame:
     df_calc['btc_correlation'] = merged_df['returns'].rolling(window=BTC_CORR_PERIOD).corr(merged_df['btc_returns'])
     df_calc['hour_of_day'] = df_calc.index.hour
     
-    # إضافة المؤشرات المتقدمة
-    df_calc['adx'], df_calc['adx_pos'], df_calc['adx_neg'] = calculate_adx(
-        df_calc['high'], df_calc['low'], df_calc['close']
-    )
+    # ميزات جديدة
+    df_calc['price_volume_interaction'] = df_calc['close'] * df_calc['volume']
+    df_calc['volatility'] = df_calc['close'].pct_change().rolling(window=14).std()
     
-    df_calc['mfi'] = calculate_mfi(
-        df_calc['high'], df_calc['low'], df_calc['close'], df_calc['volume']
-    )
-    
-    # VWAP
-    cumulative_volume = df_calc['volume'].cumsum()
-    cumulative_typical = ((df_calc['high'] + df_calc['low'] + df_calc['close']) / 3) * df_calc['volume']
-    df_calc['vwap'] = cumulative_typical.cumsum() / cumulative_volume
-    
-    df_calc['cci'] = calculate_cci(
-        df_calc['high'], df_calc['low'], df_calc['close']
-    )
-    
-    # مؤشرات تفاعلية
-    df_calc['rsi_macd_interaction'] = df_calc['rsi'] * df_calc['macd_hist']
-    df_calc['atr_volume_interaction'] = df_calc['atr'] * df_calc['relative_volume']
-    
-    # التقلب التاريخي
-    df_calc['volatility'] = df_calc['close'].pct_change().rolling(14).std()
+    # الترميز الدوري للوقت
+    df_calc['hour_sin'] = np.sin(2 * np.pi * df_calc['hour_of_day']/24)
+    df_calc['hour_cos'] = np.cos(2 * np.pi * df_calc['hour_of_day']/24)
     
     return df_calc
 
-def get_enhanced_labels(prices: pd.Series, atr: pd.Series, volatility: pd.Series) -> pd.Series:
-    """وضع علامات متقدمة باستخدام تقنية Triple-Barrier المعززة"""
-    labels = pd.Series(0, index=prices.index)
-    volatility_factor = 1 + (volatility.rolling(14).std() * 0.5)  # عامل التقلب الديناميكي
+def remove_outliers(df: pd.DataFrame, column: str, threshold: float = 3.0) -> pd.DataFrame:
+    """يزيل القيم المتطرفة باستخدام طريقة Z-Score"""
+    z_scores = np.abs(stats.zscore(df[column]))
+    return df[(z_scores < threshold)]
+
+def balance_classes(df: pd.DataFrame, target_column: str) -> pd.DataFrame:
+    """يوازن الفئات في مجموعة البيانات"""
+    class_counts = df[target_column].value_counts()
+    min_count = class_counts.min()
     
-    for i in tqdm(range(len(prices) - MAX_HOLD_PERIOD), desc="Enhanced Labeling", leave=False):
+    balanced_dfs = []
+    for cls in class_counts.index:
+        cls_df = df[df[target_column] == cls]
+        if len(cls_df) > min_count:
+            cls_df = resample(cls_df, n_samples=min_count, random_state=42)
+        balanced_dfs.append(cls_df)
+    
+    return pd.concat(balanced_dfs)
+
+def get_triple_barrier_labels(prices: pd.Series, atr: pd.Series) -> pd.Series:
+    """يولد تسميات باستخدام طريقة الحواجز الثلاثية"""
+    labels = pd.Series(0, index=prices.index)
+    for i in tqdm(range(len(prices) - MAX_HOLD_PERIOD), desc="Labeling", leave=False):
         entry_price = prices.iloc[i]
         current_atr = atr.iloc[i]
-        vol_factor = volatility_factor.iloc[i] if not pd.isna(volatility_factor.iloc[i]) else 1
+        if pd.isna(current_atr) or current_atr == 0: continue
         
-        if pd.isna(current_atr) or current_atr == 0: 
-            continue
-            
-        tp_level = entry_price + (current_atr * TP_ATR_MULTIPLIER * vol_factor)
-        sl_level = entry_price - (current_atr * SL_ATR_MULTIPLIER * vol_factor)
+        # تحديد فئة التقلب
+        volatility_category = 'medium'
+        if current_atr > 0.05:  # مثال لتحديد فئة التقلب
+            volatility_category = 'high'
+        elif current_atr < 0.01:
+            volatility_category = 'low'
         
-        # تتبع أفضل/أسوأ أداء خلال فترة الاحتفاظ
-        best_gain = -np.inf
-        worst_loss = np.inf
+        # معلمات ديناميكية بناءً على فئة التقلب
+        if volatility_category == 'high':
+            tp_multiplier = 2.5
+            sl_multiplier = 1.2
+        elif volatility_category == 'low':
+            tp_multiplier = 1.5
+            sl_multiplier = 2.0
+        else:  # medium
+            tp_multiplier = 2.0
+            sl_multiplier = 1.5
+        
+        upper_barrier = entry_price + (current_atr * tp_multiplier)
+        lower_barrier = entry_price - (current_atr * sl_multiplier)
         
         for j in range(1, MAX_HOLD_PERIOD + 1):
-            if i + j >= len(prices): 
-                break
-                
-            current_price = prices.iloc[i + j]
-            
-            # تتبع أعلى ربح وأكبر خسارة
-            gain = (current_price - entry_price) / entry_price
-            if gain > best_gain:
-                best_gain = gain
-                
-            loss = (current_price - entry_price) / entry_price
-            if loss < worst_loss:
-                worst_loss = loss
-                
-            # خروج عند تحقيق الهدف أو الوقف
-            if current_price >= tp_level:
-                labels.iloc[i] = 1
-                break
-            if current_price <= sl_level:
-                labels.iloc[i] = -1
-                break
-        else:
-            # إذا لم يحقق أي مستوى، نحدد التصنيف بناءً على الأداء النسبي
-            if best_gain > abs(worst_loss) and best_gain > 0.005:  # عتبة ربح دنيا
-                labels.iloc[i] = 1
-            elif abs(worst_loss) > best_gain and abs(worst_loss) > 0.005:  # عتبة خسارة دنيا
-                labels.iloc[i] = -1
-                
+            if i + j >= len(prices): break
+            if prices.iloc[i + j] >= upper_barrier:
+                labels.iloc[i] = 1; break
+            if prices.iloc[i + j] <= lower_barrier:
+                labels.iloc[i] = -1; break
     return labels
-
-def remove_outliers(df, columns, threshold=3):
-    """إزالة القيم المتطرفة باستخدام تقنية Z-Score القوية"""
-    for col in columns:
-        median = df[col].median()
-        mad = np.abs(df[col] - median).median()
-        if mad == 0:  # تجنب القسمة على صفر
-            continue
-        z_score = 0.6745 * (df[col] - median) / mad
-        df = df[np.abs(z_score) < threshold]
-    return df
-
-def balance_classes(X, y):
-    """موازنة الفئات باستخدام تقنية ADASYN المتقدمة"""
-    from imblearn.over_sampling import ADASYN
-    ada = ADASYN(random_state=42, sampling_strategy='auto', n_neighbors=5)
-    return ada.fit_resample(X, y)
 
 def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> Optional[Tuple[pd.DataFrame, pd.Series, List[str]]]:
     logger.info(f"ℹ️ [ML Prep] Preparing data for {symbol}...")
     df_featured = calculate_features(df, btc_df)
+    df_featured['target'] = get_triple_barrier_labels(df_featured['close'], df_featured['atr'])
     
-    # وضع العلامات المتقدمة
-    df_featured['target'] = get_enhanced_labels(
-        df_featured['close'], 
-        df_featured['atr'], 
-        df_featured['volatility']
-    )
+    # إزالة القيم المتطرفة في المدة
+    if 'duration' in df_featured.columns:
+        df_featured = remove_outliers(df_featured, 'duration', threshold=3.0)
+    
+    # موازنة الفئات
+    df_featured = balance_classes(df_featured, 'target')
     
     feature_columns = [
         'rsi', 'macd_hist', 'atr', 'relative_volume', 'hour_of_day',
         'price_vs_ema50', 'price_vs_ema200', 'btc_correlation',
         'stoch_rsi_k', 'stoch_rsi_d', 'macd_cross', 'market_condition',
-        'bb_width', 'adx', 'adx_pos', 'adx_neg', 'mfi',
-        'vwap', 'cci', 'volatility', 
-        'rsi_macd_interaction', 'atr_volume_interaction'
+        'bb_width', 'price_volume_interaction', 'volatility',
+        'hour_sin', 'hour_cos'
     ]
     
     df_cleaned = df_featured.dropna(subset=feature_columns + ['target']).copy()
-    
-    # إزالة القيم المتطرفة
-    df_cleaned = remove_outliers(df_cleaned, feature_columns)
-    
     if df_cleaned.empty or df_cleaned['target'].nunique() < 2:
         logger.warning(f"⚠️ [ML Prep] Data for {symbol} has less than 2 classes. Skipping.")
         return None
-        
     logger.info(f"📊 [ML Prep] Target distribution for {symbol}:\n{df_cleaned['target'].value_counts(normalize=True)}")
-    
     X = df_cleaned[feature_columns]
     y = df_cleaned['target']
-    
     return X, y, feature_columns
 
-# --- دوال التدريب المتقدمة ---
-def train_enhanced_model(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
-    """تدريب متقدم باستخدام البحث العشوائي وموازنة الفئات"""
-    logger.info("ℹ️ [ML Train] Starting advanced model training...")
-    
-    # موازنة الفئات
-    X_bal, y_bal = balance_classes(X, y)
-    
-    # تقسيم البيانات مع التحقق من التسرب الزمني
-    tscv = TimeSeriesSplit(n_splits=5)
-    
-    # معايرة المعلمات باستخدام البحث العشوائي
-    param_dist = {
-        'learning_rate': [0.01, 0.05, 0.1],
-        'n_estimators': [300, 500, 700],
-        'max_depth': [3, 5, 7],
-        'subsample': [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8, 0.9],
-        'reg_alpha': [0, 0.1, 0.5],
-        'reg_lambda': [0, 0.1, 0.5]
-    }
-    
-    best_model = None
-    best_scaler = None
-    best_score = -np.inf
-    
-    for fold, (train_index, val_index) in enumerate(tscv.split(X_bal)):
-        X_train, X_val = X_bal.iloc[train_index], X_bal.iloc[val_index]
-        y_train, y_val = y_bal.iloc[train_index], y_bal.iloc[val_index]
+def train_with_walk_forward_validation(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
+    logger.info("ℹ️ [ML Train] Starting training with Walk-Forward Validation...")
+    tscv = TimeSeriesSplit(n_splits=10)
+    final_model, final_scaler = None, None
+
+    for i, (train_index, test_index) in enumerate(tscv.split(X)):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
         
-        # المعايرة
         scaler = StandardScaler().fit(X_train)
-        X_train_scaled = scaler.transform(X_train)
-        X_val_scaled = scaler.transform(X_val)
         
-        # البحث العشوائي عن أفضل معلمات
-        model = lgb.LGBMClassifier(objective='multiclass', num_class=3, random_state=42)
-        random_search = RandomizedSearchCV(
-            model, param_dist, n_iter=20, cv=3, scoring='f1_weighted', n_jobs=-1
-        )
-        random_search.fit(X_train_scaled, y_train)
+        X_train_scaled = pd.DataFrame(scaler.transform(X_train), columns=X.columns, index=X_train.index)
+        X_test_scaled = pd.DataFrame(scaler.transform(X_test), columns=X.columns, index=X_test.index)
         
-        # تقييم النموذج
-        val_preds = random_search.best_estimator_.predict(X_val_scaled)
-        score = f1_score(y_val, val_preds, average='weighted')
+        model = lgb.LGBMClassifier(
+            objective='multiclass', num_class=3, random_state=42, n_estimators=300,
+            learning_rate=0.05, class_weight='balanced', n_jobs=-1 )
         
-        logger.info(f"🔍 [Fold {fold+1}] Best params: {random_search.best_params_}, Score: {score:.4f}")
+        model.fit(X_train_scaled, y_train, eval_set=[(X_test_scaled, y_test)],
+                  eval_metric='multi_logloss', callbacks=[lgb.early_stopping(30, verbose=False)])
         
-        if score > best_score:
-            best_model = random_search.best_estimator_
-            best_scaler = scaler
-            best_score = score
-    
-    if not best_model or not best_scaler:
+        y_pred = model.predict(X_test_scaled)
+        report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+        logger.info(f"--- Fold {i+1}: Accuracy: {accuracy_score(y_test, y_pred):.4f}, "
+                    f"P(1): {report.get('1', {}).get('precision', 0):.4f}, "
+                    f"P(-1): {report.get('-1', {}).get('precision', 0):.4f}")
+        
+        final_model, final_scaler = model, scaler
+
+    if not final_model or not final_scaler:
         logger.error("❌ [ML Train] Training failed, no model was created.")
         return None, None, None
-    
-    # تدريب النموذج النهائي على كامل البيانات
-    X_full_scaled = best_scaler.transform(X_bal)
-    best_model.fit(X_full_scaled, y_bal)
-    
-    # حساب المقاييس النهائية
-    y_pred = best_model.predict(X_full_scaled)
-    final_report = classification_report(y_bal, y_pred, output_dict=True, zero_division=0)
-    
+
+    all_preds = []
+    all_true = []
+    for _, test_index in tscv.split(X):
+        X_test_final = X.iloc[test_index]
+        y_test_final = y.iloc[test_index]
+        X_test_final_scaled = pd.DataFrame(final_scaler.transform(X_test_final), columns=X.columns, index=X_test_final.index)
+        all_preds.extend(final_model.predict(X_test_final_scaled))
+        all_true.extend(y_test_final)
+
+    final_report = classification_report(all_true, all_preds, output_dict=True, zero_division=0)
     avg_metrics = {
-        'accuracy': accuracy_score(y_bal, y_pred),
-        'f1_weighted': f1_score(y_bal, y_pred, average='weighted'),
-        'precision_1': precision_score(y_bal, y_pred, labels=[1], average='binary'),
-        'recall_1': recall_score(y_bal, y_pred, labels=[1], average='binary'),
-        'precision_-1': precision_score(y_bal, y_pred, labels=[-1], average='binary'),
-        'recall_-1': recall_score(y_bal, y_pred, labels=[-1], average='binary'),
-        'num_samples_trained': len(X_bal),
-        'best_params': random_search.best_params_
+        'accuracy': accuracy_score(all_true, all_preds),
+        'precision_class_1': final_report.get('1', {}).get('precision', 0),
+        'recall_class_1': final_report.get('1', {}).get('recall', 0),
+        'num_samples_trained': len(X),
     }
-    
-    metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in avg_metrics.items() if isinstance(v, float)])
-    logger.info(f"📊 [ML Train] Final Model Performance: {metrics_log_str}")
-    
-    return best_model, best_scaler, avg_metrics
 
-def detect_data_drift(X_ref: pd.DataFrame, X_current: pd.DataFrame) -> float:
-    """كشف انجراح البيانات باستخدام تقنية Kullback-Leibler"""
-    kl_divergences = []
-    for col in X_ref.columns:
-        try:
-            # إنشاء سلال متوافقة للبيانات المرجعية والجارية
-            combined = pd.concat([X_ref[col], X_current[col]])
-            bins = np.histogram_bin_edges(combined, bins=50)
-            
-            # حساب التوزيعات
-            p, _ = np.histogram(X_ref[col], bins=bins, density=True)
-            q, _ = np.histogram(X_current[col], bins=bins, density=True)
-            
-            # تجنب القيم الصفرية
-            p = np.clip(p, 1e-10, None)
-            q = np.clip(q, 1e-10, None)
-            
-            # حساب تباعد KL
-            kl_divergences.append(entropy(p, q))
-        except Exception as e:
-            logger.warning(f"⚠️ [Drift] Error calculating KL for {col}: {e}")
-    
-    return np.mean(kl_divergences) if kl_divergences else 0.0
-
-def partial_fit_model(model, scaler, X_new, y_new):
-    """التدريب التكيفي للنموذج مع بيانات جديدة"""
-    X_new_scaled = scaler.transform(X_new)
-    model = model.booster_.reset_parameter()
-    model.fit(
-        X_new_scaled, 
-        y_new,
-        init_model=model,
-        callbacks=[lgb.reset_parameter(learning_rate=lambda epoch: 0.01 * (0.99 ** epoch))]
-    )
-    return model
+    metrics_log_str = ', '.join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
+    logger.info(f"📊 [ML Train] Average Walk-Forward Performance: {metrics_log_str}")
+    return final_model, final_scaler, avg_metrics
 
 def save_ml_model_to_db(model_bundle: Dict[str, Any], model_name: str, metrics: Dict[str, Any]):
     logger.info(f"ℹ️ [DB Save] Saving model bundle '{model_name}'...")
     try:
         model_binary = pickle.dumps(model_bundle)
         metrics_json = json.dumps(metrics)
-        with conn.cursor() as db_cur:
-            db_cur.execute("""
+        with conn.cursor() as cur:
+            cur.execute("""
                 INSERT INTO ml_models (model_name, model_data, trained_at, metrics) 
                 VALUES (%s, %s, NOW(), %s) ON CONFLICT (model_name) DO UPDATE SET 
                 model_data = EXCLUDED.model_data, trained_at = NOW(), metrics = EXCLUDED.metrics;
@@ -517,6 +385,73 @@ def send_telegram_message(text: str):
     try: requests.post(url, json={'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}, timeout=10)
     except Exception as e: logger.error(f"❌ [Telegram] فشل إرسال الرسالة: {e}")
 
+def train_pair_specific_models(symbols: List[str]):
+    """يدرب نماذج خاصة بكل فئة من أزواج العملات"""
+    logger.info("ℹ️ [Training] Starting pair-specific model training...")
+    
+    # تجميع الرموز حسب فئة التقلب
+    category_symbols = {'high': [], 'medium': [], 'low': []}
+    
+    for symbol in symbols:
+        volatility_category = None
+        for cat, cat_symbols in VOLATILITY_CATEGORIES.items():
+            if symbol in cat_symbols:
+                volatility_category = cat
+                break
+        
+        if volatility_category is None:
+            # إذا لم يكن في أي فئة، نستخدم متوسط التقلب كافتراضي
+            volatility_category = 'medium'
+        
+        category_symbols[volatility_category].append(symbol)
+    
+    # تدريب نموذج لكل فئة
+    for category, symbols_in_category in category_symbols.items():
+        if not symbols_in_category:
+            logger.info(f"⚠️ [Training] No symbols found for category: {category}")
+            continue
+        
+        logger.info(f"ℹ️ [Training] Training model for {category} volatility category with {len(symbols_in_category)} symbols")
+        
+        category_data = []
+        for symbol in symbols_in_category:
+            df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
+            if df_hist is None or df_hist.empty:
+                logger.warning(f"⚠️ [Training] No data for {symbol}, skipping.")
+                continue
+            
+            prepared_data = prepare_data_for_ml(df_hist, btc_data_cache, symbol)
+            if prepared_data is None:
+                continue
+            X, y, feature_names = prepared_data
+            
+            # إضافة بيانات الرمز إلى مجموعة الفئة
+            X['symbol'] = symbol
+            category_data.append(pd.concat([X, y], axis=1))
+        
+        if not category_data:
+            logger.warning(f"⚠️ [Training] No valid data for {category} category.")
+            continue
+        
+        category_df = pd.concat(category_data)
+        X_category = category_df.drop('target', axis=1)
+        y_category = category_df['target']
+        
+        training_result = train_with_walk_forward_validation(X_category, y_category)
+        if not all(training_result):
+            logger.warning(f"⚠️ [Training] Training failed for {category} category.")
+            continue
+        
+        final_model, final_scaler, model_metrics = training_result
+        
+        if final_model and final_scaler and model_metrics.get('precision_class_1', 0) > 0.35:
+            model_bundle = {'model': final_model, 'scaler': final_scaler, 'feature_names': feature_names}
+            model_name = f"{BASE_ML_MODEL_NAME}_{category}_volatility"
+            save_ml_model_to_db(model_bundle, model_name, model_metrics)
+            logger.info(f"✅ [Training] Saved model for {category} volatility category: {model_name}")
+    
+    logger.info("✅ [Training] Completed pair-specific model training")
+
 def run_training_job():
     logger.info(f"🚀 Starting ADVANCED ML model training job ({BASE_ML_MODEL_NAME})...")
     init_db()
@@ -529,13 +464,15 @@ def run_training_job():
         
     send_telegram_message(f"🚀 *{BASE_ML_MODEL_NAME} Training Started*\nWill train models for {len(symbols_to_train)} symbols.")
     
-    successful_models, failed_models = 0, 0
-    reference_models = {}  # لتخزين نماذج مرجعية لكشف الانجراح
+    # تدريب نماذج خاصة بكل فئة
+    train_pair_specific_models(symbols_to_train)
     
+    # تدريب النماذج الفردية
+    successful_models, failed_models = 0, 0
     for symbol in symbols_to_train:
         logger.info(f"\n--- ⏳ [Main] Starting model training for {symbol} ---")
         try:
-            df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, days=DATA_LOOKBACK_DAYS_FOR_TRAINING)
+            df_hist = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, DATA_LOOKBACK_DAYS_FOR_TRAINING)
             if df_hist is None or df_hist.empty:
                 logger.warning(f"⚠️ [Main] No data for {symbol}, skipping."); failed_models += 1; continue
             
@@ -544,31 +481,16 @@ def run_training_job():
                 failed_models += 1; continue
             X, y, feature_names = prepared_data
             
-            # كشف انجراح البيانات (إذا كان لدينا نموذج سابق)
-            model_name = f"{BASE_ML_MODEL_NAME}_{symbol}"
-            if symbol in reference_models:
-                drift_score = detect_data_drift(reference_models[symbol], X)
-                logger.info(f"📈 [Drift] Data drift score for {symbol}: {drift_score:.4f}")
-                if drift_score > 0.25:
-                    send_telegram_message(f"⚠️ *Data Drift Alert*: {symbol} (Score: {drift_score:.4f}")
-            
-            # تدريب النموذج
-            training_result = train_enhanced_model(X, y)
+            training_result = train_with_walk_forward_validation(X, y)
             if not all(training_result):
                  failed_models += 1; continue
             final_model, final_scaler, model_metrics = training_result
             
-            # حفظ النموذج إذا كان أداءه جيداً
-            if final_model and final_scaler and model_metrics.get('precision_1', 0) > 0.35:
-                model_bundle = {
-                    'model': final_model, 
-                    'scaler': final_scaler, 
-                    'feature_names': feature_names,
-                    'last_trained': datetime.utcnow().isoformat()
-                }
+            if final_model and final_scaler and model_metrics.get('precision_class_1', 0) > 0.35:
+                model_bundle = {'model': final_model, 'scaler': final_scaler, 'feature_names': feature_names}
+                model_name = f"{BASE_ML_MODEL_NAME}_{symbol}"
                 save_ml_model_to_db(model_bundle, model_name, model_metrics)
                 successful_models += 1
-                reference_models[symbol] = X  # حفظ كمرجع لكشف الانجراح المستقبلي
             else:
                 logger.warning(f"⚠️ [Main] Model for {symbol} is not useful. Discarding."); failed_models += 1
         except Exception as e:
