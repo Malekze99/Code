@@ -311,6 +311,7 @@ def prepare_data_for_ml(df: pd.DataFrame, btc_df: pd.DataFrame, symbol: str) -> 
 
 def train_with_walk_forward_validation(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
     logger.info("ℹ️ [ML Train] Starting training with Walk-Forward Validation...")
+    X = X.select_dtypes(include=[np.number])
     tscv = TimeSeriesSplit(n_splits=10)
     final_model, final_scaler = None, None
 
