@@ -1,4 +1,4 @@
-pandas_ta
+git+https://github.com/twopirllc/pandas-ta.git
 lightgbm
 gunicorn
 redis
