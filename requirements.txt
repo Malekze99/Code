@@ -1,15 +1,16 @@
+pandas_ta
 lightgbm
 gunicorn
 redis
 pandas
-numpy<1.24
+numpy
 psycopg2 
 python-binance>=1.0.16
 requests>=2.31.0
 Flask
 python-decouple
 APScheduler
-scikit-learn==1.1.3
+scikit-learn
 waitress
 psycopg2-binary
 pandas_ta 
@@ -22,13 +23,3 @@ websockets
 aiohttp
 waitress
 flask-cors
-# requirements.txt
-binance-connector
-psycopg2-binary
-python-decouple
-tenacity
-imbalanced-learn
-optuna
-ta>=0.11.0
-matplotlib
-shap
