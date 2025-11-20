@@ -1,4 +1,3 @@
-https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
 lightgbm
 gunicorn
 redis
